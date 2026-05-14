@@ -1,0 +1,4 @@
+interface:
+  display_name: "Celo Migration"
+  short_description: "SFLuv Berachain to Celo migration context"
+  default_prompt: "Use this skill to plan, implement, or communicate the SFLuv migration from Berachain to Celo."

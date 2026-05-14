@@ -1,0 +1,101 @@
+# Migration Plan
+
+## Goals
+
+- Move SFLuv from Berachain to Celo without changing user-facing wallet addresses.
+- Preserve legacy Berachain transaction history for lookup.
+- Move all clients to dynamic backend-hosted config.
+- Enforce mobile client compatibility before the migration cutover.
+- Deploy Celo SFLUV balances to match Berachain balances, then deprecate Berachain SFLUV safely.
+
+## Phase 0: Mobile Gating And Dynamic Config
+
+Ship a preliminary mobile release before any chain cutover:
+
+1. Add native version metadata and a public backend `/client-version` check.
+2. Add runtime config bootstrapping from backend `/config`, with bundled defaults.
+3. Render a blocking update/maintenance screen before `PrivyProvider` when the backend marks the installed build incompatible.
+4. Dynamicize chain name, native currency, RPC, token, paymaster, entrypoint, factory, explorer, app origin, and Citizen Wallet engine/backend values.
+5. Wait until adoption is high enough to safely enforce `minimum` build.
+
+Reason: current mobile app has Berachain defaults baked into source/env and no force-update path. See [investigations/mobile-app.md](investigations/mobile-app.md).
+
+## Phase 1: Config Authority
+
+Add backend-hosted config and version endpoints:
+
+- `GET /config`: public, cacheable, no secrets, merged from Citizen Wallet config endpoint, internal JSON fallback, then hardcoded defaults.
+- `GET /client-version`: public, platform-aware compatibility policy for web/mobile/Citizen Wallet-facing surfaces.
+
+Load order:
+
+1. Backend attempts `https://config.internal.citizenwallet.xyz/v4/communities.json`.
+2. Backend selects the SFLuv Berachain community object while still pre-cutover.
+3. Backend falls back to an internally defined JSON file.
+4. Backend falls back to hardcoded safe defaults.
+5. Web/mobile fetch backend config at boot and fall back to bundled defaults only if backend is unavailable.
+
+Schema notes live in [schemas/backend-config.md](schemas/backend-config.md).
+
+## Phase 2: Client And Server Readiness
+
+Prepare code changes across clients and backend:
+
+- Web app: replace static `app.config.ts` authority with backend config, while keeping build-time defaults.
+- Mobile app: consume backend config and version policy before wallet/service boot.
+- Backend: parameterize chain/token/RPC config and add chain-aware transaction verification.
+- Ponder: preserve Berachain history and add Celo indexing with explicit chain identity.
+- Citizen Wallet: validate remote config update behavior and chain-id cache behavior before relying on silent config switch.
+
+Important backend transaction work:
+
+- Add `chain_id` to transaction identity at API boundaries.
+- Add `chain_id` to Ponder transfer events or route to chain-specific Ponder DBs.
+- Use `(chain_id, tx_hash)` for memo authorization, transaction lookup, and onchain confirmation.
+- Default missing legacy `chain_id` to Berachain only for old clients.
+
+## Phase 3: Celo Onchain Execution
+
+Run the Celo deployment script:
+
+1. Connect to backend DB.
+2. Snapshot users' EOA addresses, smart wallet addresses, smart indices, and migration-eligible account balances.
+3. Read Berachain balances for every relevant EOA/smart wallet address, with explicit exception handling.
+4. Load a prefunded deployer private key.
+5. Deploy each smart wallet on Celo using the stored EOA and smart index.
+6. Deploy Celo SFLUV proxy/implementation or distribution implementation.
+7. Distribute Celo SFLUV balances to match Berachain snapshot balances.
+8. Add backing assets to match distributed supply.
+9. Upgrade to final SFLUV implementation if a temporary distribution implementation was used.
+10. Verify supply, backing, roles, implementations, sample balances, and client config output.
+
+Script design lives in [runbooks/celo-deploy-script.md](runbooks/celo-deploy-script.md).
+
+## Phase 4: Cutover
+
+After Celo deployment verifies:
+
+1. Switch backend config to Celo.
+2. Switch deployed backend env/RPC/token values to Celo.
+3. Switch or launch Celo Ponder.
+4. Confirm web boot, mobile boot, send/receive, redemption, workflow payout, merchant lookup, and transaction history.
+5. Confirm Citizen Wallet behavior for existing SFLuv users.
+6. Monitor errors, support channels, and backend logs.
+
+## Phase 5: Berachain Deprecation
+
+Only after manual verification:
+
+1. Run the Berachain wipe script.
+2. Upgrade Berachain SFLUV proxy to a deprecation implementation.
+3. Sweep underlying backing ERC20s to the designated treasury/safe address.
+4. Revert all user-facing token methods with `SFLuv has migrated to CELO.`
+5. Leave read-only Berachain Ponder data available.
+
+Script design lives in [runbooks/bera-wipe-script.md](runbooks/bera-wipe-script.md).
+
+## Rollback Stance
+
+- Before Berachain wipe: rollback should mean switching backend config back to Berachain and pausing Celo-facing actions.
+- After Berachain wipe: rollback is not practical. Treat wipe as the point of no return.
+- Never run wipe until client cutover has been verified on web, new mobile, old mobile behavior, and Citizen Wallet.

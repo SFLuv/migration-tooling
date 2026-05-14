@@ -1,0 +1,12 @@
+[submodule "repos/app"]
+	path = repos/app
+	url = https://github.com/SFLuv/app.git
+[submodule "repos/mobile-app"]
+	path = repos/mobile-app
+	url = https://github.com/SFLuv/mobile-app.git
+[submodule "repos/contracts"]
+	path = repos/contracts
+	url = https://github.com/SFLuv/contracts.git
+[submodule "repos/cw-app"]
+	path = repos/cw-app
+	url = https://github.com/citizenwallet/app.git
