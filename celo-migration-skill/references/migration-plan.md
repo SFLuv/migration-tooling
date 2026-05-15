@@ -7,6 +7,7 @@
 - Move all clients to dynamic backend-hosted config.
 - Enforce mobile client compatibility before the migration cutover.
 - Deploy Celo SFLUV balances to match Berachain balances, then deprecate Berachain SFLUV safely.
+- Back Celo SFLUV with Celo USDC at `0xcebA9300f2b948710d2653dD7B07f33A8B32118C`.
 
 ## Phase 0: Mobile Gating And Dynamic Config
 
@@ -44,7 +45,7 @@ Prepare code changes across clients and backend:
 - Web app: replace static `app.config.ts` authority with backend config, while keeping build-time defaults.
 - Mobile app: consume backend config and version policy before wallet/service boot.
 - Backend: parameterize chain/token/RPC config and add chain-aware transaction verification.
-- Ponder: preserve Berachain history and add Celo indexing with explicit chain identity.
+- Ponder/history: provide one backend transaction-history surface spanning Berachain and Celo, with explicit chain identity. Implementation may use one chain-aware database or separate indexers/DBs behind a unified backend API, but user-facing history must remain continuous.
 - Citizen Wallet: validate remote config update behavior and chain-id cache behavior before relying on silent config switch.
 
 Important backend transaction work:
@@ -75,12 +76,14 @@ Script design lives in [runbooks/celo-deploy-script.md](runbooks/celo-deploy-scr
 
 After Celo deployment verifies:
 
-1. Switch backend config to Celo.
-2. Switch deployed backend env/RPC/token values to Celo.
-3. Switch or launch Celo Ponder.
-4. Confirm web boot, mobile boot, send/receive, redemption, workflow payout, merchant lookup, and transaction history.
-5. Confirm Citizen Wallet behavior for existing SFLuv users.
-6. Monitor errors, support channels, and backend logs.
+1. Pause all user-facing and backend-initiated money movement through backend feature flags or equivalent operational controls.
+2. Switch backend config to Celo.
+3. Switch deployed backend env/RPC/token values to Celo.
+4. Switch or launch Celo Ponder.
+5. Confirm web boot, mobile boot, send/receive, redemption, workflow payout, merchant lookup, and transaction history.
+6. Confirm Citizen Wallet behavior for existing SFLuv users.
+7. Re-enable paused flows only after smoke tests pass.
+8. Monitor errors, support channels, and backend logs.
 
 ## Phase 5: Berachain Deprecation
 

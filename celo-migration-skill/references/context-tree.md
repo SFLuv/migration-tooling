@@ -36,14 +36,18 @@ The `repos/` entries are git submodules. Treat `./repos` as the canonical source
 - Target Celo chain id: `42220`.
 - Account factory expected to be identical on Berachain and Celo: `0x7cC54D54bBFc65d1f0af7ACee5e4042654AF8185`.
 - Existing Berachain SFLUV proxy/token in code: `0x881cad4f885c6701d8481c0ed347f6d35444ea7e`.
+- Existing Berachain Zapper contract: `0xd0EBD0495750899D18b915BDeba789E2defdC394`.
+- Target Celo backing asset: USDC at `0xcebA9300f2b948710d2653dD7B07f33A8B32118C`.
 - Citizen Wallet public config source to mirror/fallback from: `https://config.internal.citizenwallet.xyz/v4/communities.json`.
 
 ## Working Assumptions
 
 - User EOA addresses and smart wallet indices in the backend DB are sufficient to derive matching Celo smart wallet addresses if the Celo factory is byte-for-byte compatible and configured identically.
 - Merchant payment wallets, contact addresses, primary rewards accounts, and user primary wallets should continue to work by address if smart-wallet address derivation matches.
-- Legacy transaction history does not need to remain live-indexed on Berachain after cutover, but it must remain queryable for clients and backend workflows.
+- Legacy Berachain transaction history must remain queryable alongside Celo transaction history for user accounting and continuity, but Berachain does not need to stay live-ingested after cutover.
+- User-facing UI should not show chain labels by default; chain identity is for backend/API/export/accounting correctness, not ordinary wallet UX.
 - Mobile rollout gating is the long pole. A preliminary mobile release should ship dynamic config and version enforcement before the chain switch.
+- During cutover, all user-facing and backend-initiated money movement should be temporarily halted to avoid split-chain or partially confirmed states.
 
 ## Root Git Layout
 

@@ -19,6 +19,7 @@ SFLuv has migrated to CELO.
 - Mobile latest verified.
 - Old mobile behavior understood and acceptable.
 - Citizen Wallet behavior verified.
+- All money-movement flows paused.
 - Treasury/safe sweep destination approved.
 - DEFAULT_ADMIN key/signer for Berachain SFLUV proxy available.
 

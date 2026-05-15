@@ -24,6 +24,11 @@ The Berachain mainnet proxy/token address appears hardcoded as `0x881cAd4f885c67
 - `contracts/script/MintSFLUVv2.s.sol:13`
 - `contracts/NOTES.txt:14`
 
+Known Berachain companion contract:
+
+- Zapper: `0xd0EBD0495750899D18b915BDeba789E2defdC394`.
+- Read-only checks on 2026-05-15 confirmed the Zapper exposes the same `DEFAULT_ADMIN_ROLE`, `MINTER_ROLE`, and `REDEEMER_ROLE` constants as SFLUV. `owner()` reverts on both SFLUV and Zapper, so role discovery should use AccessControl role events and `hasRole`.
+
 The deployed implementation address is not recorded in repo. It lives in the ERC1967 implementation slot.
 
 ## Storage Layout Hazards
@@ -79,6 +84,7 @@ The Celo deploy script therefore needs an external snapshot from the backend DB 
 
 - Treat storage-layout validation as mandatory before any upgrade.
 - Parameterize all addresses and chain values by env or JSON, not constants.
+- Discover and record current Berachain SFLUV/Zapper role holders before choosing equivalent Celo role holder addresses.
 - Build script outputs as durable artifacts: wallet snapshot, balance snapshot, deployment addresses, tx hashes, verification summary, and rollback status.
 - Use dry-run mode against forked Berachain/Celo before production broadcast.
 - Do not run Berachain wipe until Celo deployment and client cutover have been manually verified.

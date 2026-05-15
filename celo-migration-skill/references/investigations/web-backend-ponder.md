@@ -68,12 +68,19 @@ Backend transaction queries are address/hash-only:
 
 ## Preservation Options
 
-Preferred low-risk option:
+Product requirement:
+
+- Backend exposes unified transaction history across Berachain and Celo so users can see continuous accounting history.
+- Berachain data remains queryable after cutover but does not need continued live ingestion once SFLuv has fully stopped interacting with Berachain.
+- User-facing wallet UI should not show chain labels by default. Keep chain identity available in backend/API/export/accounting details where it matters.
+
+Low-risk implementation option:
 
 - Keep old Berachain Ponder DB read-only as `ponder_berachain`.
 - Launch a Celo Ponder DB as active.
 - Backend routes transaction queries to a chain-specific Ponder DB using `chain_id`.
 - Missing `chain_id` defaults to Berachain only for legacy clients until a sunset date.
+- Backend merges/renders results as one user-facing history surface where needed.
 
 Alternate option:
 

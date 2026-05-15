@@ -63,6 +63,14 @@ Account derivation calls the configured factory with owner and constant salt/ind
 
 Chain id is not passed to `getAddress`; it only determines which RPC/factory is contacted.
 
+Migration planning note, 2026-05-15: SFLuv expects same-address behavior on Celo because it matches Citizen Wallet's intended account-factory design. CeloScan confirms the target factory `0x7cC54D54bBFc65d1f0af7ACee5e4042654AF8185` exists on Celo and has successful `createAccount(address,uint256)` activity.
+
+Initial sample verification, 2026-05-15:
+
+- EOA `0x0e314f1F33Ddf60D28D25d381aD871f2eF096640`, index `0` returns `0x72441d9C8fbf917495f69798757e3D7A18a6c63d` on Celo, matching the known Berachain smart wallet.
+- EOA `0x0e314f1F33Ddf60D28D25d381aD871f2eF096640`, index `1` returns `0x0f3dE0f4ce42C059165cf60d7361d8C5AE38B498` on Celo, matching the known Berachain smart wallet.
+- This is encouraging but not sufficient; still verify against a broader backend wallet snapshot before production deployment.
+
 UserOp signing is chain/entrypoint dependent:
 
 - `cw-app/lib/services/wallet/contracts/entrypoint.dart:42`

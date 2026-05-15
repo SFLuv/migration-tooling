@@ -17,6 +17,8 @@ The mobile app is Expo/React Native TypeScript. It does not currently have a for
 
 No direct update enforcement exists.
 
+Current shared app backend requests do not include app version, build number, or platform metadata in request headers or bodies. `AppBackendClient.authFetch` sends the Privy `Access-Token` header only, and public shared-backend calls such as `/locations` and `/redeem` also omit version/build/platform metadata.
+
 Reusable pieces:
 
 - Blocking screen pattern: `MissingPrivyConfigScreen` in `mobile-app/mobile/App.tsx:2586`.
@@ -46,6 +48,8 @@ Config is static/build-time:
 - The mobile app does not appear to call this backend push endpoint.
 - Server-side chain config is loaded from startup config and is not published to the mobile client. See `mobile-app/backend/internal/config/config.go:11`.
 
+The current mobile app also talks directly to Citizen Wallet engine-style JSON-RPC for account-abstraction operations. `mobileConfig.wallet.backendURL` defaults to `https://80094.engine.citizenwallet.xyz`, and `BackendClient` sends `pm_sponsorUserOperation`, `eth_sendUserOperation`, and `eth_getTransactionReceipt` there. This is separate from the shared app backend at `EXPO_PUBLIC_APP_BACKEND_URL`.
+
 ## Required Implementation
 
 1. Add real native build metadata:
@@ -53,6 +57,7 @@ Config is static/build-time:
    - `android.versionCode`
    - optionally `runtimeVersion`
 2. Add `AppBackendClient.getClientVersion(platform, version, build)` and `AppBackendClient.getConfig()`.
+   - Add version/build/platform metadata to shared-backend requests so the backend can intentionally block old clients instead of relying only on broken Berachain-era behavior after cutover.
 3. Fetch version/config before rendering `PrivyProvider` in `mobile-app/mobile/App.tsx:2599`.
 4. Use a blocking screen, patterned after `MissingPrivyConfigScreen`, for forced update, maintenance, incompatible chain, or config fetch failure when required.
 5. Dynamicize all chain config:
