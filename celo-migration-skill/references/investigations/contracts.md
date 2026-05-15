@@ -46,7 +46,11 @@ Unsafe pattern:
 - Adding temporary child storage that final code assumes absent.
 - Corrupting AccessControl storage that gates upgrades.
 
-Wrapper backing token is initialized at `contracts/src/SFLUVv2.sol:27`. Current deploy hardcodes Berachain HONEY at `contracts/script/DeploySFLUVv2.s.sol:11`; the Celo deploy must parameterize backing token.
+Wrapper backing token is initialized at `contracts/src/SFLUVv2.sol:27`. Current deploy hardcodes Berachain HONEY at `contracts/script/DeploySFLUVv2.s.sol:11`; the Celo deploy must parameterize backing token. **Decided: Celo backing asset is native USDC.**
+
+## Holder Scale
+
+As of 2026-05-15, Berachain SFLUV has 286 token holders. At this scale, direct final deployment with per-address `depositFor` is gas-feasible and the temporary distribution implementation adds complexity without meaningful benefit.
 
 ## Tooling
 

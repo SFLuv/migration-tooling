@@ -51,7 +51,7 @@ Opening an existing wallet loads the stored address/private key and applies the 
 - `cw-app/lib/state/wallet/logic.dart:333`
 - `cw-app/lib/state/wallet/logic.dart:374`
 
-If the same alias flips from Berachain to Celo, the app may keep the old stored account address while using new Celo RPC/factory/paymaster/token config. This only works if the stored smart wallet address is exactly the Celo-derived address.
+If the same alias flips from Berachain to Celo, the app may keep the old stored account address while using new Celo RPC/factory/paymaster/token config. This only works if the stored smart wallet address is exactly the Celo-derived address. **Confirmed: cross-chain address parity holds.** The same `AccountFactory` (`0x7cC5…8185`) and Safe singleton are deployed at identical addresses on both chains, so `CREATE2` produces the same wallet address for the same `(owner, nonce)`. See `/cross-chain-wallet-parity.md` for the full derivation and mainnet PoC.
 
 ## Deterministic Account Behavior
 
@@ -74,6 +74,18 @@ UserOp signing is chain/entrypoint dependent:
 - Checked-in v4 visible SFLuv Berachain alias is `wallet.berachain.sfluv.org`, custom domain `wallet.sfluv.org`, chain `80094`, token `0x881c...`, factory `0x7cC5...` in `cw-app/assets/config/v4/communities.json:251`, `:264`, and `:288`.
 - Old/hidden SFLuv Polygon alias is `wallet.sfluv.org`, chain `137`, token `0x58a2...`, factory `0x5e98...` in `cw-app/assets/config/v4/communities.json:331`, `:345`, and `:369`.
 - v3 legacy SFLuv was also Polygon `wallet.sfluv.org` in `cw-app/assets/config/v3/communities.json:599`, `:620`, and `:636`.
+
+## Balances And Indexer
+
+Balances are fetched directly from chain via RPC, not from the indexer. `getBalance` at `cw-app/lib/services/wallet/wallet.dart:109` calls `_contractToken.getBalance()` — a standard ERC20 `balanceOf` through `web3dart`. Balances will work on Celo as soon as the config points to Celo RPC and the new token address.
+
+Transaction history and real-time events come from the indexer via WebSocket at `/v1/events/{contractAddress}/{topic}` (`cw-app/lib/services/engine/events.dart:76`). The indexer is also used for account registration (`cw-app/lib/services/accounts/utils.dart:47`) and health checks (`cw-app/lib/services/config/service.dart:223`).
+
+Indexer config is part of the community JSON as `IndexerConfig` with `url`, `ipfs_url`, and `key` fields (`cw-app/lib/services/config/config.dart:170`).
+
+**Multi-chain history concern:** Ideally the indexer would preserve Berachain transaction history and start indexing new Celo transactions seamlessly. It is unclear whether the CW indexer supports multi-chain continuity within a single community — and even if the schema allows it, this is unlikely to be well tested. Additionally, the CW app client may not handle mixed-chain transaction lists correctly (e.g., explorer links would point to the wrong chain for old transactions).
+
+**Pragmatic fallback:** Accept that CW transaction history resets at cutover. Old Berachain transaction history remains available through the SFLuv backend Ponder data, which the migration plan already preserves as read-only.
 
 ## Additional Risks
 

@@ -22,10 +22,17 @@
 
 ## Citizen Wallet
 
-- Does Celo factory `getAddress(owner, 0)` match existing saved Berachain smart wallet addresses for real SFLuv users?
+- ~~Does Celo factory `getAddress(owner, 0)` match existing saved Berachain smart wallet addresses for real SFLuv users?~~ **Confirmed: yes. See `/cross-chain-wallet-parity.md` — same `AccountFactory`, same Safe singleton, same proxy bytecode → identical addresses via CREATE2. Empirically verified on mainnet.**
 - Does same-alias config flip leave a stale cached chain id?
 - Can Citizen Wallet tolerate a Berachain-to-Celo config update without requiring users to reinstall or reimport?
 - If not, who coordinates a Citizen Wallet app update?
+
+## Citizen Wallet Indexer
+
+- Does the CW indexer support multi-chain transaction continuity within a single community, or does a config flip to Celo reset history?
+- If history resets, is "CW history starts fresh on Celo, old history available via SFLuv backend" acceptable to users?
+- Does the CW app client render mixed-chain transaction lists correctly (explorer links, chain metadata)?
+- No known staging/feature-flag mechanism exists in CW to test config flip on a single device. Testing options are: coordinate with CW team, sideload a custom build, or skip testing and use a new alias.
 
 ## Backend / Ponder
 
@@ -36,8 +43,8 @@
 
 ## Contracts / Onchain
 
-- What Celo backing asset backs SFLUV at launch?
-- Will Celo deployment use final wrapper minting/deposit flow or a temporary distribution implementation?
+- ~~What Celo backing asset backs SFLUV at launch?~~ **Decided: native USDC on Celo.**
+- Will Celo deployment use final wrapper minting/deposit flow or a temporary distribution implementation? With only 286 holders on Berachain, direct final deployment with `depositFor` is strongly favored — temporary distribution complexity is hard to justify at this scale.
 - If temporary distribution is used, has storage layout been proven identical to final implementation?
 - Who controls `DEFAULT_ADMIN_ROLE` after Celo deployment?
 - What exact safe receives swept Berachain backing assets?
