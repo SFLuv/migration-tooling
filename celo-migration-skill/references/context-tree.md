@@ -16,7 +16,7 @@ This file is the entry point for migration context. Load only the branch needed 
 - `repos/cw-app` -> `https://github.com/citizenwallet/app.git`
   - Citizen Wallet Flutter app.
 
-The `repos/` entries are git submodules. Treat `./repos` as the canonical source locator for all checked references. After cloning or pulling the root migration repo, run `git submodule update --init --recursive` to materialize missing source checkouts. Do not use previously existing sibling/local copies such as `../app`, `../mobile-app`, `../contracts`, or `../cw-app` as reference authority unless the user explicitly asks for that local checkout.
+The `repos/` entries are git submodules. Treat `./repos` as the canonical source locator for all checked references. After cloning or pulling the root migration repo, run `git submodule update --init --recursive` to materialize missing source checkouts. `repos/app` and `repos/mobile-app` also use `.gitmodules` `branch = .`; after switching or pulling a root branch that expects matching app/mobile branches, run `git submodule update --remote --merge repos/app repos/mobile-app`. Plain `git pull` does not float submodules to their remote branch heads. Do not use previously existing sibling/local copies such as `../app`, `../mobile-app`, `../contracts`, or `../cw-app` as reference authority unless the user explicitly asks for that local checkout.
 
 ## What To Read
 
@@ -48,6 +48,8 @@ The `repos/` entries are git submodules. Treat `./repos` as the canonical source
 ## Root Git Layout
 
 The root repo tracks migration documentation, `.gitmodules`, and submodule gitlinks only. Source contents remain owned by their upstream repos.
+
+For branch-based app/mobile implementation work, root `.gitmodules` sets `branch = .` on `repos/app` and `repos/mobile-app`. This lets `git submodule update --remote --merge repos/app repos/mobile-app` move those submodules to the branch matching the current root branch, such as `pjol/config-loadin`, when it exists remotely.
 
 ```text
 migration-tooling/

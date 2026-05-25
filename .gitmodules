@@ -1,9 +1,11 @@
 [submodule "repos/app"]
 	path = repos/app
 	url = https://github.com/SFLuv/app.git
+	branch = .
 [submodule "repos/mobile-app"]
 	path = repos/mobile-app
 	url = https://github.com/SFLuv/mobile-app.git
+	branch = .
 [submodule "repos/contracts"]
 	path = repos/contracts
 	url = https://github.com/SFLuv/contracts.git

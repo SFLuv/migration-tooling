@@ -177,6 +177,16 @@ Custom signing flows (session keys, recovery, off-chain attestations) need to ex
 - **Legacy Celo communities:** existing Celo communities use older, non-unified factories (`0x940C…`, `0x0a9F…`, etc.), so users of those communities have *different* Celo addresses from their Berachain addresses. Migrating those communities to factory `0x7cC5…8185` would give new wallets on the unified address scheme, but existing wallets stay at their legacy addresses. Any migration UX needs to surface both addresses to the user.
 - **PoC EOA in this doc:** `0xd04131b641f32cA7cd3AB805189467492c9e9360` was used as a real test. The deployed Safe at `0x04e37f13ea865cd38e47e2686f7dead98c64b3f8` exists on both chains and is owned by that EOA.
 
+## Repository workflow note
+
+`repos/app` and `repos/mobile-app` are submodules configured with `.gitmodules` `branch = .`. After switching or pulling a root migration branch, run:
+
+```bash
+git submodule update --remote --merge repos/app repos/mobile-app
+```
+
+This moves those submodules to the branch matching the current root branch when it exists remotely. Plain `git pull` updates the top-level repo and recorded gitlinks, but it does not by itself float submodules to their remote branch heads.
+
 ## References
 
 - `citizenwallet/contractforge/src/Modules/Community/AccountFactory.sol` — factory + address derivation.

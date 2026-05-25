@@ -44,6 +44,12 @@ After cloning this migration repo, materialize source checkouts with:
 git submodule update --init --recursive
 ```
 
+`repos/app` and `repos/mobile-app` use `.gitmodules` `branch = .`, so they can follow the current root branch name when the same branch exists in those submodule remotes. Plain `git pull` does not float those submodules to their remote branch heads. After switching or pulling a root branch that expects matching app/mobile branches, run:
+
+```bash
+git submodule update --remote --merge repos/app repos/mobile-app
+```
+
 When checking or refreshing source references, treat `repos/` as the canonical source locator. Avoid silently falling back to previously existing local copies outside this migration repo, because they may be stale or from a different branch. If a submodule is intentionally moved to another branch or commit for investigation, record that branch/commit in the relevant reference file.
 
 ## Reference Index
