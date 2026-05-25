@@ -4,6 +4,17 @@ The second landing in the dynamic-config series. Landing 1 introduced the provid
 
 After this lands, switching the active chain is a backend env change and a redeploy of the Go backend — no frontend rebuild needed.
 
+## Current branch notes
+
+The `pjol/config-loadin` branch implements the consumer migration differently from this staged Landing 2 plan:
+
+- Backend `/config` is the single chain source for web and mobile, and the clients no longer define BYUSD/HONEY/Zapper/faucet/backing-assets in client env or hardcoded constants.
+- `extras` is now the bridge only for chain-specific values that Citizen Wallet config does not model. The backend reads `HONEY_*`, `BYUSD_*`, `ZAPPER_*`, `FAUCET_*`, and `BACKING_ASSETS` env aliases, merges them into `/config.extras`, and preserves unknown extras fields.
+- Citizen Wallet fields remain authoritative wherever they exist. Web resolves BYUSD/HONEY from the CW `tokens` map first, then falls back to extras only if those tokens are not present. Existing callsites still expose convenience fields like `byusdTokenAddress`, `honeyTokenAddress`, `zapperContractAddress`, and `faucetAddress`.
+- Mobile maps the same `/config.extras` fields into `AppClientConfig`; reward labeling now uses fetched `faucetAddress` instead of a bundled faucet address.
+- The branch does not yet implement SSR injection, the `__sfluv_config` script tag, staleness banner, or config parity scripts from this document.
+- The original plan kept `app.config.ts` as a frontend fallback. The branch removes it and relies on backend boot-time remote/fallback config instead.
+
 ## Goal
 
 Replace every build-time chain reference in `app/frontend/` with a runtime read from `useChainConfig()`, fed by a `/config` payload embedded in the initial HTML by the Next.js server. The provider blocks render until config is resolved (which, with SSR injection, is synchronous at first paint). After this landing, the only place `app.config.ts` is read is inside `staticFallback()` — and the fallback only runs when the SSR fetch itself fails.
@@ -183,7 +194,7 @@ export type ResolvedChainConfig = {
 };
 ```
 
-The `extras` block is populated from the Go backend's `/config` response. The backend already has `NEXT_PUBLIC_HONEY_ADDRESS`, `NEXT_PUBLIC_BYUSD_ADDRESS`, `NEXT_PUBLIC_ZAPPER_ADDRESS`, `NEXT_PUBLIC_FAUCET_ADDRESS`, `NEXT_PUBLIC_BACKING_ASSETS` available as env. A small backend PR extends the `/config` payload to include them under an `extras` map. If a value is empty/unset on a chain (e.g., Celo), the field is omitted, and `features.zapperEnabled` is false.
+The `extras` block is populated from the Go backend's `/config` response. In the current branch, the backend accepts server-side aliases such as `HONEY_ADDRESS`, `BYUSD_ADDRESS`, `ZAPPER_ADDRESS`, `FAUCET_ADDRESS`, and `BACKING_ASSETS`, plus the earlier `NEXT_PUBLIC_*` names for compatibility. Values are emitted under `/config.extras`; empty values are omitted. If BYUSD/HONEY are present in the Citizen Wallet `tokens` map, their env extras are omitted from the served payload and clients use the CW token entries. Clients should treat missing implementation extras as disabled integrations.
 
 The wallet methods that use these (`zapIn`, `unwrapSwapAndBridge`, etc. in `lib/wallets/wallets.ts`) check `features.zapperEnabled` and throw a clear error if disabled. UI surfaces that expose these flows check the same flag and hide themselves.
 
@@ -193,7 +204,7 @@ Ordered to keep production working at every step. Each item should be its own PR
 
 | # | Task | Files | Est |
 |---|------|-------|-----|
-| 1 | Extend Go backend `/config` payload with `extras` map (honey, byusd, zapper, backing assets, faucet, etc.) and `features.zapper_enabled` bool. Default to current Berachain values from env. | `app/backend/structs/app_client_config.go`, `app/backend/handlers/app_client_config.go` | 3h |
+| 1 | Extend Go backend `/config` payload with `extras` map (honey, byusd, zapper, backing assets, faucet, etc.) from backend env. Current branch implements this in `backend/clientconfig`. | `app/backend/clientconfig/config.go`, `app/backend/handlers/app_client_config.go` | Done |
 | 2 | Extend `ResolvedChainConfig`, `transformPayload()`, `staticFallback()` from Landing 1 to include the new `extras` and `zapperEnabled` fields. Update L1's parity check to assert the new fields match between remote and static. | `lib/chainConfig/*` | 3h |
 | 3 | Add `initialConfig` prop to `<ChainConfigProvider>`. Internalize it as initial state. The hook is no longer nullable — it returns `ResolvedChainConfig` directly. Update L1 typings. | `context/ChainConfigProvider.tsx`, `lib/chainConfig/types.ts` | 2h |
 | 4 | Add SSR fetch in `app/layout.tsx`. Embed config script tag. Pass `initialConfig` to provider. | `app/layout.tsx` | 4h |

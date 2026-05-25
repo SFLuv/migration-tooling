@@ -38,7 +38,8 @@
 
 - Will Berachain and Celo Ponder data live in separate databases or one migrated schema?
 - What is the default behavior for old clients that omit `chain_id` after cutover?
-- Should transaction memos be migrated to `(chain_id, tx_hash)` with `80094` backfill?
+- Transaction rows that are not yet tagged should be backfilled on service boot to the current active chain id, while already-tagged rows are left untouched. Confirm the operational order so legacy Berachain rows are tagged before any service boots with Celo as active.
+- Should transaction memos be migrated to `(chain_id, tx_hash)` with boot-time active-chain backfill?
 - Should W9 yearly earning keys include `chain_id`, or should migrated Celo balances intentionally share wallet-year totals?
 
 ## Contracts / Onchain

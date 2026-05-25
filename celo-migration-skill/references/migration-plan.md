@@ -13,9 +13,9 @@
 Ship a preliminary mobile release before any chain cutover:
 
 1. Add native version metadata and a public backend `/client-version` check.
-2. Add runtime config bootstrapping from backend `/config`, with bundled defaults.
+2. Add runtime config bootstrapping from backend `/config` before wallet/service boot.
 3. Render a blocking update/maintenance screen before `PrivyProvider` when the backend marks the installed build incompatible.
-4. Dynamicize chain name, native currency, RPC, token, paymaster, entrypoint, factory, explorer, app origin, and Citizen Wallet engine/backend values.
+4. Dynamicize chain name, native currency, RPC, token, paymaster, entrypoint, factory, explorer, app origin, Citizen Wallet engine/backend values, and backend-provided chain extras.
 5. Wait until adoption is high enough to safely enforce `minimum` build.
 
 Reason: current mobile app has Berachain defaults baked into source/env and no force-update path. See [investigations/mobile-app.md](investigations/mobile-app.md).
@@ -24,16 +24,16 @@ Reason: current mobile app has Berachain defaults baked into source/env and no f
 
 Add backend-hosted config and version endpoints:
 
-- `GET /config`: public, cacheable, no secrets, merged from Citizen Wallet config endpoint, internal JSON fallback, then hardcoded defaults.
+- `GET /config`: public, cacheable, no secrets, loaded from the per-community Citizen Wallet config endpoint and merged with backend env extras for fields Citizen Wallet does not model.
 - `GET /client-version`: public, platform-aware compatibility policy for web/mobile/Citizen Wallet-facing surfaces.
 
 Load order:
 
-1. Backend attempts `https://config.internal.citizenwallet.xyz/v4/communities.json`.
-2. Backend selects the SFLuv Berachain community object while still pre-cutover.
-3. Backend falls back to an internally defined JSON file.
-4. Backend falls back to hardcoded safe defaults.
-5. Web/mobile fetch backend config at boot and fall back to bundled defaults only if backend is unavailable.
+1. Backend attempts the configured per-community Citizen Wallet config URL, normally `${CITIZEN_WALLET_CONFIG_BASE_URL}/${CITIZEN_WALLET_COMMUNITY_ALIAS}.json`.
+2. Backend falls back to a local JSON file in the backend root with the same Citizen Wallet config shape.
+3. Backend fails to boot if neither remote nor local config loads.
+4. Backend adds top-level `extras` from known chain env values only when there is no Citizen Wallet field for the value. Examples include underlying/backing asset setup, bridge/Zapper contracts, and faucet contracts. BYUSD/HONEY token metadata should come from the Citizen Wallet `tokens` map whenever those token entries exist.
+5. Web/mobile fetch backend config at boot and use it as the chain source of truth. Client-side chain constants/env values should not define blockchain addresses, RPCs, or integration contracts.
 
 Schema notes live in [schemas/backend-config.md](schemas/backend-config.md).
 
@@ -50,9 +50,12 @@ Prepare code changes across clients and backend:
 Important backend transaction work:
 
 - Add `chain_id` to transaction identity at API boundaries.
+- Add `chain_id` anywhere transactions or transaction hashes are stored in Ponder, bot DBs, or app DBs.
 - Add `chain_id` to Ponder transfer events or route to chain-specific Ponder DBs.
+- Include `chain_id` in bot, Ponder, and app logs for transaction ingestion, verification, redemption, payout, and memo paths.
 - Use `(chain_id, tx_hash)` for memo authorization, transaction lookup, and onchain confirmation.
-- Default missing legacy `chain_id` to Berachain only for old clients.
+- Add idempotent service-boot backfills for untagged transaction rows. Each service should read the active chain id from current backend config/env, update only rows where `chain_id` is missing or null, log per-table counts, and leave any already-tagged row untouched.
+- Default missing legacy `chain_id` at old API boundaries only where needed for compatibility; persisted records should be backfilled/tagged rather than staying ambiguous.
 
 ## Phase 3: Celo Onchain Execution
 

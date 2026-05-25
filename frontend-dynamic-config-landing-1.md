@@ -2,6 +2,18 @@
 
 The first of a multi-landing refactor that converts the web UI from build-time static chain config to runtime config fetched from the backend's `/config` endpoint. This landing introduces the infrastructure with **no consumers**, so production behavior is unchanged but every subsequent landing has somewhere to plug into.
 
+## Current branch notes
+
+The `pjol/config-loadin` implementation has intentionally moved past this original Landing 1 boundary:
+
+- Backend `/config` now loads the per-community Citizen Wallet config by alias at boot, falls back to a root backend JSON file with the same Citizen Wallet shape, and fails boot if neither source loads.
+- `/config` returns the Citizen Wallet-shaped payload, not the normalized `active_chain_id` shape sketched below.
+- Chain-specific fields with no Citizen Wallet home, such as backing-asset setup, bridge/Zapper contracts, and faucet contracts, are loaded from backend env and exposed under top-level `extras`.
+- Web and mobile both fetch `/config` during app boot and use it for chain, token, account factory, paymaster, RPC, explorer, app origin, and implementation-specific extras.
+- Citizen Wallet fields remain authoritative wherever they exist. BYUSD/HONEY are resolved from the CW `tokens` map first; extras only fill them when the token entries are absent.
+- `frontend/app.config.ts` has been removed instead of kept as a static frontend fallback. The fallback lives in `backend/community-config.json`.
+- SSR injection, staleness banners, and parity/debug scripts remain differences from this plan and are still future work.
+
 ## Goal
 
 Ship a `ChainConfigProvider` + `useChainConfig()` hook that fetches `GET /config` on app boot, transforms the payload into the runtime shape the rest of the app needs, and falls back to the current static `lib/constants.ts` values if the fetch fails. No existing code reads from the hook yet — `lib/constants.ts` exports stay exactly as they are. After this lands, the dynamic config payload is live in production, observable, and one Edit away from being adopted.

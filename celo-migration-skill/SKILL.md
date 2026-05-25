@@ -22,7 +22,8 @@ Treat this skill as shared migration memory. When a conversation that has loaded
 ## Non-Negotiables
 
 - Treat client versioning as phase 0. The native mobile app cannot be reliably migrated until a released build can fetch backend config and enforce minimum compatible versions.
-- Treat chain identity as data. New transaction, memo, W9, Ponder, and confirmation flows should carry `chain_id`; legacy Berachain defaults are only a compatibility bridge.
+- Treat chain identity as data. New transaction, memo, W9, bot, Ponder, app-DB, logging, and confirmation flows should carry `chain_id`; legacy defaults are only a compatibility bridge.
+- Backfill untagged stored transaction records on service boot with the active chain id from current backend config/env, and leave any already-tagged record untouched.
 - Preserve Berachain Ponder history as read-only or explicitly backfilled with `chain_id=80094` before indexing Celo data.
 - Keep smart-wallet derivation anchored to the existing account factory `0x7cC54D54bBFc65d1f0af7ACee5e4042654AF8185` and the stored user EOA plus smart wallet index.
 - Do not assume Citizen Wallet silently rewrites saved account addresses. Dynamic config updates work, but saved account/address and cached chain-id behavior must be validated.

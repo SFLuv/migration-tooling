@@ -4,6 +4,30 @@
 
 Purpose: public runtime configuration for web/mobile clients. This endpoint must contain no secrets.
 
+Current implementation:
+
+- Response shape is the raw Citizen Wallet per-community JSON shape: `community`, `tokens`, `accounts`, `chains`, `scan`, `ipfs`, `plugins`, `config_location`, and `version`.
+- Backend loads that config on boot from `${CITIZEN_WALLET_CONFIG_BASE_URL}/${CITIZEN_WALLET_COMMUNITY_ALIAS}.json`, or `CITIZEN_WALLET_CONFIG_URL` when set.
+- If remote config fails, backend loads a local fallback JSON file with the same shape, normally `backend/community-config.json`.
+- If neither source loads, the backend fails to boot.
+- Backend merges known env-only chain values into a top-level `extras` object before serving `/config`. `extras` is only for implementation-specific values that Citizen Wallet config does not model:
+
+```json
+{
+  "extras": {
+    "honey_token_address": "0x...",
+    "honey_decimals": 18,
+    "byusd_token_address": "0x...",
+    "byusd_decimals": 6,
+    "zapper_address": "0x...",
+    "faucet_address": "0x...",
+    "backing_assets": ["0x..."]
+  }
+}
+```
+
+`extras` is intentionally optional. Empty env values are omitted and already-present unknown `extras` fields are preserved. Citizen Wallet fields remain authoritative wherever they exist: web and mobile must resolve BYUSD/HONEY from the CW `tokens` map first, and use `/config.extras` only when those token entries are absent. Zapper/bridge, faucet, and backing-asset implementation details should come from `/config.extras` rather than client env or hardcoded constants.
+
 Recommended response:
 
 ```json
@@ -144,6 +168,9 @@ Add `chain_id` to:
 - Ponder hook subscriptions and callbacks
 - W9 transaction and yearly earning records
 - workflow payout tx confirmation metadata
+- bot/redeemer/minter tx verification records and logs
+- app DB records that store tx hashes, including memos, W9 `last_tx_hash`, workflow payout hashes, manager payout hashes, and unwrap tx hashes
+- Ponder event tables and hook payload logs
 
 Prefer identity:
 
@@ -156,3 +183,10 @@ For event rows:
 ```text
 (chain_id, tx_hash, log_index)
 ```
+
+Startup backfill rule:
+
+- On service boot, read the active chain id from current backend config/env.
+- Backfill only transaction rows whose `chain_id` is missing or null to that active chain id.
+- Never rewrite rows that already have a `chain_id`.
+- Log the table name, active chain id, and count of rows updated.

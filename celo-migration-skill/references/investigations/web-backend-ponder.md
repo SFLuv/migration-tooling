@@ -25,8 +25,7 @@ Recommendation: move web to backend `/config` as runtime authority, with bundled
 Backend chain config is env-scattered:
 
 - `TOKEN_ID`, `UNDERLYING_TOKEN_ID`, `TOKEN_DECIMALS`, `RPC_URL`, backing assets, bot/admin/redeemer values in `app/backend/.env.example:20`.
-- No first-class `CHAIN_ID` today.
-- No `/config` or `/client-version` route exists in `app/backend/router/router.go:87`.
+- As of the `repos/app` main update to `c978d92` on 2026-05-25, first-class `CHAIN_ID`, `/config`, and `/client-version` exist in `app/backend/handlers/app_client_config.go`, `app/backend/structs/app_client_config.go`, and `app/backend/router/router.go`.
 - Transaction/Ponder routes are registered in `app/backend/router/router.go:275`.
 
 Direct onchain services:
@@ -65,6 +64,8 @@ Backend transaction queries are address/hash-only:
 - `app/backend/db/ponder_transactions.go:90`
 - `app/backend/handlers/ponder_transactions.go:12`
 - Memos are keyed by `tx_hash` only in `app/backend/db/app_memo.go:9` and schema `app/backend/db/app.go:400`.
+- App DB transaction-hash fields are not yet consistently chain-tagged, including memo rows, W9 `last_tx_hash`, workflow payout hashes, manager payout hashes, and unwrap tx hashes.
+- Bot/redeemer/minter transaction verification logs should include chain id in addition to tx hash/token/from/to/amount.
 
 ## Preservation Options
 
@@ -94,5 +95,19 @@ Add or carry `chain_id` through:
 - Ponder hooks
 - transfer events/accounts
 - onchain confirmation jobs
+- bot/redeemer/minter tx storage, verification, and logs
+- workflow payout and manager payout tx metadata
+- unwrap and account-deletion balance/transaction checks where tx hashes are stored or reported
+
+## Boot Backfill Requirement
+
+Every service that owns transaction storage must run an idempotent startup migration before processing new events:
+
+1. Read the active chain id from current backend config/env.
+2. Ensure transaction-bearing tables have a nullable `chain_id` column before constraints are tightened.
+3. Backfill only untagged rows (`chain_id IS NULL` or missing during migration) to the active chain id.
+4. Leave already-tagged rows untouched, even if they differ from the current active chain.
+5. Log the active chain id, table name, and updated row count so operators can verify the migration.
+6. After backfill, new writes must provide `chain_id`; later migrations may add not-null constraints and `(chain_id, tx_hash)` indexes.
 
 For backwards compatibility, legacy clients that omit `chain_id` should default to Berachain only where that preserves old behavior.
