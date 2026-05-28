@@ -73,13 +73,12 @@ Read from chain:
 
 1. Before the onchain migration, pause Berachain SFLUV user activity and wait for Berachain Ponder to index through the final paused block.
 2. Stop the Berachain Ponder process.
-3. Backfill/tag any untagged Berachain transaction-bearing rows as `chain_id=80094` before starting any service with Celo as active.
+3. Reuse the existing Ponder DB for the Celo Ponder instance if validation confirms Ponder can safely continue from the existing schema/state.
 4. Run the Celo balance population with Ponder stopped or with Celo indexing disabled.
 5. Record `celo_population_complete_block` and `celo_population_complete_timestamp` in the deployment artifact.
-6. Seed Celo opening balance checkpoints for all migrated addresses using the final allocation plan.
-7. Initialize Celo `transfer_account` rows from the same checkpoint data so future Ponder deltas update from the correct opening balance.
-8. Start Celo Ponder at `celo_population_complete_block + 1`.
-9. Verify that Celo distribution transaction hashes do not appear in user `/transactions` history and are not counted in W9 yearly totals.
+6. Start Celo Ponder at `celo_population_complete_block + 1`.
+7. Verify continuity-ledger behavior: Ponder-derived balances equal Celo onchain balances, transaction history excludes distribution txs, and W9 totals include real paid activity across chains without counting migration distribution.
+8. If backend/Ponder reads remain active-chain scoped, stop and seed an opening-balance checkpoint or adjust reads before enabling user traffic.
 
 ## Required Artifacts
 
@@ -89,7 +88,7 @@ Read from chain:
 - `exceptions.json`
 - `deployment-result.json`
 - `verification-report.json`
-- `ponder-opening-checkpoint.json`
+- `ponder-continuity-report.json`
 
 Each artifact should include:
 

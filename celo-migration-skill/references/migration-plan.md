@@ -77,10 +77,12 @@ Script design lives in [runbooks/celo-deploy-script.md](runbooks/celo-deploy-scr
 Ponder/W9 cutover note, added 2026-05-27:
 
 - Pause user-facing Berachain token activity first, then let Berachain Ponder index through the final paused block before stopping it.
-- Backfill/tag all legacy Berachain Ponder/app/bot transaction rows with `chain_id=80094` before any backend or Ponder process boots with Celo as the active chain.
+- Treat the existing Ponder DB as a cross-chain continuity ledger if we can run the Celo Ponder instance against it. In that model, do not reset or reseed Ponder balances; existing Berachain-derived balances are the logical opening balances for Celo.
+- Ponder event identity can rely on Ponder's chain-aware event id scheme for uniqueness. Explicit `chain_id` remains useful metadata for explorer links/display, but Ponder balance/history/W9 lookups should not require chain-filtered reads.
+- Backfill/tag app/bot transaction records where backend verification or UI needs explicit chain metadata, but avoid operationally depending on Ponder-row retagging for the cutover.
 - Distribute Celo opening balances while Ponder is stopped or while Celo indexing is disabled.
 - Start Celo Ponder at the block after the final balance population transaction, so migration distribution transfers do not appear in user transaction history and do not trigger W9 or notification hooks.
-- Because post-population indexing skips the opening transfers, seed an explicit Celo opening-balance checkpoint for every migrated address and initialize Celo `transfer_account` balances from that checkpoint. Historical balance queries must add post-checkpoint deltas to the checkpoint balance instead of summing from zero.
+- Current backend code must be aligned with this model: Ponder-backed balance, history, analytics, and W9 queries should aggregate the continuity ledger across chains rather than filtering only the active chain. A checkpoint is only needed if we choose to keep chain-scoped Ponder balance reads.
 
 ## Phase 4: Cutover
 
@@ -89,7 +91,7 @@ After Celo deployment verifies:
 1. Switch backend config to Celo.
 2. Switch deployed backend env/RPC/token values to Celo.
 3. Switch or launch Celo Ponder from `celo_population_complete_block + 1`.
-4. Verify Celo opening-balance checkpoints and `transfer_account` rows match Celo onchain balances for the migration snapshot.
+4. Verify Ponder continuity balances match Celo onchain balances after applying post-cutover deltas.
 5. Confirm migration distribution transfers are absent from `/transactions` history and W9 yearly totals.
 6. Confirm web boot, mobile boot, send/receive, redemption, workflow payout, merchant lookup, and transaction history.
 7. Confirm Citizen Wallet behavior for existing SFLuv users.

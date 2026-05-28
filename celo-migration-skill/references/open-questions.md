@@ -36,11 +36,11 @@
 
 ## Backend / Ponder
 
-- Will Berachain and Celo Ponder data live in separate databases or one migrated schema? Current recommendation assumes one active Ponder chain at a time, chain-aware tables, and a Celo opening-balance checkpoint seeded before Celo Ponder starts from `population_complete_block + 1`; validate Ponder framework behavior when changing config against the same DB.
+- Will Berachain and Celo Ponder data live in separate databases or one migrated schema? Current preference is one reused Ponder DB as a cross-chain continuity ledger, with Celo Ponder starting from `population_complete_block + 1`; validate Ponder framework behavior when changing config against the same DB.
 - What is the default behavior for old clients that omit `chain_id` after cutover?
 - Transaction rows that are not yet tagged should be backfilled on service boot to the current active chain id, while already-tagged rows are left untouched. Confirm the operational order so legacy Berachain rows are tagged before any service boots with Celo as active.
 - Should transaction memos be migrated to `(chain_id, tx_hash)` with boot-time active-chain backfill?
-- Should W9 yearly earning keys include `chain_id`, or should migrated Celo balances intentionally share wallet-year totals? Earnings are now chain-aware; W9 submissions remain wallet/year keyed, so decide whether approval should intentionally carry across chains for the same wallet/year.
+- Should W9 yearly earning keys include `chain_id`, or should migrated Celo balances intentionally share wallet-year totals? Current preference is cross-chain W9 earning totals for the same wallet/year so Berachain pre-cutover paid activity and Celo post-cutover paid activity are counted together.
 
 ## Contracts / Onchain
 

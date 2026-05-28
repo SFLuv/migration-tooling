@@ -77,29 +77,38 @@ Backend transaction queries are address/hash-only:
 
 ## Ponder Cutover Recommendation
 
-Use a pause-and-checkpoint cutover rather than indexing Celo distribution transfers as normal user history:
+Preferred continuity-ledger model, revised 2026-05-27:
+
+If the Celo Ponder instance can safely reuse the existing Ponder DB, preserve that DB as the canonical cross-chain SFLuv ledger. In this model the existing Berachain-derived balances remain the logical opening balances for Celo, so no explicit Celo opening-balance adjustment is needed in Ponder.
 
 1. Put app/backend mutation paths into maintenance or otherwise pause sends, redemptions, workflow payouts, and merchant/payment activity.
 2. Pause or deprecate the Berachain SFLUV contract so no more Berachain transfer events can occur.
 3. Let Berachain Ponder index through the final paused block, then stop the Berachain Ponder process.
-4. Explicitly tag any untagged Berachain Ponder/app/bot transaction rows as `chain_id=80094` before booting anything with Celo as the active chain. Do not rely on active-chain boot backfill after config cutover.
+4. Keep the existing Ponder DB in place for the Celo Ponder instance. Do not wipe, rebuild, or reseed Ponder balance rows.
 5. Snapshot Berachain balances at the final Berachain block and run Celo deployment/distribution while Ponder indexing is stopped or Celo indexing is disabled.
 6. Record `celo_population_complete_block` and `celo_population_complete_timestamp`.
-7. Seed a Celo opening-balance checkpoint for every migrated address and initialize Celo `transfer_account` rows from that checkpoint.
-8. Start Celo Ponder with `chain_id=42220`, Celo SFLUV token, and `PONDER_START_BLOCK=celo_population_complete_block + 1`.
-9. Switch backend config to Celo only after the Celo opening checkpoint and Ponder start block are verified.
+7. Start Celo Ponder with the Celo SFLUV token and `PONDER_START_BLOCK=celo_population_complete_block + 1`.
+8. Switch backend config to Celo only after the reused Ponder DB and start block are verified.
 
-Important caveat: starting Celo Ponder after balance population avoids fake migration transactions in history and avoids W9/notification hooks, but Ponder cannot derive opening balances from skipped events. Without an explicit checkpoint/seed, `transfer_account` rows start at zero, first post-cutover sends from migrated holders will be wrong in Ponder, and `/transactions/balance` will return zero plus post-cutover deltas. Add a checkpoint-aware historical balance query:
+Important caveat: this only works if backend/Ponder reads treat Ponder as a continuity ledger, not as independent per-chain ledgers. Current `repos/app` code has several active-chain filters:
 
-- Choose the latest checkpoint for `(chain_id, address)` with `checkpoint_timestamp <= requested_timestamp`.
-- Return `checkpoint_balance + incoming_transfer_deltas - outgoing_transfer_deltas` for events after the checkpoint and up to the requested timestamp.
-- If no checkpoint exists, fall back to the current event-sum behavior for pre-migration/legacy chains.
+- `repos/app/backend/db/ponder_transactions.go` filters transaction history, historical balance, and tx-party lookup by `chain_id`.
+- `repos/app/backend/db/ponder_w9.go` filters paid W9 totals by `chain_id`.
+- `repos/app/backend/db/ponder_analytics.go` filters transfer analytics and `transfer_account` balances by `chain_id`.
+- `repos/app/ponder/ponder.schema.ts` currently has `transfer_account` keyed by `(chain_id, address)`.
+
+Before relying on continuity, align those paths:
+
+- Transaction history and W9 totals should query the reused Ponder ledger across chains unless the product explicitly asks for per-chain filtering.
+- Current/logical balances should either use address-only `transfer_account` rows, or sum all `(chain_id, address)` balance rows for the address. With chain-keyed `transfer_account`, a first Celo send from a migrated holder can create a negative Celo row, but the sum of Berachain row plus Celo row is the intended migrated-token balance.
+- Explicit `chain_id` remains useful metadata for explorer links, display, and any future chain-specific debugging, but it should not be required for the core Ponder balance/history lookup during this migration.
+- If we instead keep active-chain-only Ponder reads, then a separate Celo opening-balance checkpoint or seed is still required.
 
 W9 handling:
 
 - Celo migration distribution transfers must not be counted as paid admin income. Starting Ponder after distribution achieves this.
 - During dry runs, also ensure the Celo distributor/migration admin address is not accidentally configured as `PAID_ADMIN_ADDRESSES` while distribution events are being indexed.
-- W9 earnings are chain-aware, but W9 submissions are still wallet/year keyed. Treat that as intentional only if a single approved form should satisfy the same user's tax form requirement across chains for that year.
+- Cross-chain W9 totals are likely the desired tax behavior for a same-user, same-wallet, same-year migration. Chain-filtered W9 totals can undercount a user who earned on Berachain before cutover and Celo after cutover in the same tax year.
 
 ## Preservation Options
 
