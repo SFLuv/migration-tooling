@@ -67,6 +67,40 @@ Backend transaction queries are address/hash-only:
 - App DB transaction-hash fields are not yet consistently chain-tagged, including memo rows, W9 `last_tx_hash`, workflow payout hashes, manager payout hashes, and unwrap tx hashes.
 - Bot/redeemer/minter transaction verification logs should include chain id in addition to tx hash/token/from/to/amount.
 
+2026-05-27 update from current `repos/app` state:
+
+- Ponder event/account/allowance schema now carries `chain_id` and uses chain-aware primary keys/indexes in `repos/app/ponder/ponder.schema.ts`.
+- Ponder hooks and W9 transaction hook payloads include `chain_id` in `repos/app/ponder/src/index.ts`.
+- Backend transaction history, transaction memo, W9 paid-total, and analytics queries are now chain-filtered in `repos/app/backend/db/ponder_transactions.go`, `repos/app/backend/db/ponder_w9.go`, and `repos/app/backend/db/ponder_analytics.go`.
+- Ponder config is still operationally single-chain in `repos/app/ponder/ponder.config.ts`, hardcoded to Berachain id `80094`, Berachain SFLUV token, and Berachain default start block. Celo cutover still needs runtime chain/token/start-block config or a Celo-specific deployment config.
+- `ponder_hooks` and app-side Ponder subscriptions remain address-only. That is acceptable only if exactly one live Ponder chain emits hooks at a time. Dual live Berachain+Celo notification indexing would need hook/subscription chain scoping.
+
+## Ponder Cutover Recommendation
+
+Use a pause-and-checkpoint cutover rather than indexing Celo distribution transfers as normal user history:
+
+1. Put app/backend mutation paths into maintenance or otherwise pause sends, redemptions, workflow payouts, and merchant/payment activity.
+2. Pause or deprecate the Berachain SFLUV contract so no more Berachain transfer events can occur.
+3. Let Berachain Ponder index through the final paused block, then stop the Berachain Ponder process.
+4. Explicitly tag any untagged Berachain Ponder/app/bot transaction rows as `chain_id=80094` before booting anything with Celo as the active chain. Do not rely on active-chain boot backfill after config cutover.
+5. Snapshot Berachain balances at the final Berachain block and run Celo deployment/distribution while Ponder indexing is stopped or Celo indexing is disabled.
+6. Record `celo_population_complete_block` and `celo_population_complete_timestamp`.
+7. Seed a Celo opening-balance checkpoint for every migrated address and initialize Celo `transfer_account` rows from that checkpoint.
+8. Start Celo Ponder with `chain_id=42220`, Celo SFLUV token, and `PONDER_START_BLOCK=celo_population_complete_block + 1`.
+9. Switch backend config to Celo only after the Celo opening checkpoint and Ponder start block are verified.
+
+Important caveat: starting Celo Ponder after balance population avoids fake migration transactions in history and avoids W9/notification hooks, but Ponder cannot derive opening balances from skipped events. Without an explicit checkpoint/seed, `transfer_account` rows start at zero, first post-cutover sends from migrated holders will be wrong in Ponder, and `/transactions/balance` will return zero plus post-cutover deltas. Add a checkpoint-aware historical balance query:
+
+- Choose the latest checkpoint for `(chain_id, address)` with `checkpoint_timestamp <= requested_timestamp`.
+- Return `checkpoint_balance + incoming_transfer_deltas - outgoing_transfer_deltas` for events after the checkpoint and up to the requested timestamp.
+- If no checkpoint exists, fall back to the current event-sum behavior for pre-migration/legacy chains.
+
+W9 handling:
+
+- Celo migration distribution transfers must not be counted as paid admin income. Starting Ponder after distribution achieves this.
+- During dry runs, also ensure the Celo distributor/migration admin address is not accidentally configured as `PAID_ADMIN_ADDRESSES` while distribution events are being indexed.
+- W9 earnings are chain-aware, but W9 submissions are still wallet/year keyed. Treat that as intentional only if a single approved form should satisfy the same user's tax form requirement across chains for that year.
+
 ## Preservation Options
 
 Preferred low-risk option:

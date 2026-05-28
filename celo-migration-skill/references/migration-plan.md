@@ -74,16 +74,26 @@ Run the Celo deployment script:
 
 Script design lives in [runbooks/celo-deploy-script.md](runbooks/celo-deploy-script.md).
 
+Ponder/W9 cutover note, added 2026-05-27:
+
+- Pause user-facing Berachain token activity first, then let Berachain Ponder index through the final paused block before stopping it.
+- Backfill/tag all legacy Berachain Ponder/app/bot transaction rows with `chain_id=80094` before any backend or Ponder process boots with Celo as the active chain.
+- Distribute Celo opening balances while Ponder is stopped or while Celo indexing is disabled.
+- Start Celo Ponder at the block after the final balance population transaction, so migration distribution transfers do not appear in user transaction history and do not trigger W9 or notification hooks.
+- Because post-population indexing skips the opening transfers, seed an explicit Celo opening-balance checkpoint for every migrated address and initialize Celo `transfer_account` balances from that checkpoint. Historical balance queries must add post-checkpoint deltas to the checkpoint balance instead of summing from zero.
+
 ## Phase 4: Cutover
 
 After Celo deployment verifies:
 
 1. Switch backend config to Celo.
 2. Switch deployed backend env/RPC/token values to Celo.
-3. Switch or launch Celo Ponder.
-4. Confirm web boot, mobile boot, send/receive, redemption, workflow payout, merchant lookup, and transaction history.
-5. Confirm Citizen Wallet behavior for existing SFLuv users.
-6. Monitor errors, support channels, and backend logs.
+3. Switch or launch Celo Ponder from `celo_population_complete_block + 1`.
+4. Verify Celo opening-balance checkpoints and `transfer_account` rows match Celo onchain balances for the migration snapshot.
+5. Confirm migration distribution transfers are absent from `/transactions` history and W9 yearly totals.
+6. Confirm web boot, mobile boot, send/receive, redemption, workflow payout, merchant lookup, and transaction history.
+7. Confirm Citizen Wallet behavior for existing SFLuv users.
+8. Monitor errors, support channels, and backend logs.
 
 ## Phase 5: Berachain Deprecation
 
