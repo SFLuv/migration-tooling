@@ -40,7 +40,8 @@
 - What is the default behavior for old clients that omit `chain_id` after cutover?
 - Transaction rows that are not yet tagged should be backfilled on service boot to the current active chain id, while already-tagged rows are left untouched. Confirm the operational order so legacy Berachain rows are tagged before any service boots with Celo as active.
 - Should transaction memos be migrated to `(chain_id, tx_hash)` with boot-time active-chain backfill?
-- Should W9 yearly earning keys include `chain_id`, or should migrated Celo balances intentionally share wallet-year totals? Current preference is cross-chain W9 earning totals for the same wallet/year so Berachain pre-cutover paid activity and Celo post-cutover paid activity are counted together.
+- Should W9 yearly earning keys include `chain_id`, or should migrated Celo balances intentionally share wallet-year totals? Backend Ponder paid-total reads now count cross-chain real paid activity for the same wallet/year; app DB earnings rows still retain chain metadata for the transaction/update that recorded the total.
+- Token decimal scale direction: launching Celo SFLUV at 6 decimals simplifies USDC backing. If confirmed, normalize legacy Ponder transfer amounts and app W9 cached raw totals from 18-decimal to 6-decimal units, then recompute Ponder balances from transformed transfers and use those balances for Celo population.
 
 ## Contracts / Onchain
 

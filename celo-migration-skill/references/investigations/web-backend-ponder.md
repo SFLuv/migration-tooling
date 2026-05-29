@@ -71,9 +71,11 @@ Backend transaction queries are address/hash-only:
 
 - Ponder event/account/allowance schema now carries `chain_id` and uses chain-aware primary keys/indexes in `repos/app/ponder/ponder.schema.ts`.
 - Ponder hooks and W9 transaction hook payloads include `chain_id` in `repos/app/ponder/src/index.ts`.
-- Backend transaction history, transaction memo, W9 paid-total, and analytics queries are now chain-filtered in `repos/app/backend/db/ponder_transactions.go`, `repos/app/backend/db/ponder_w9.go`, and `repos/app/backend/db/ponder_analytics.go`.
 - Ponder config is still operationally single-chain in `repos/app/ponder/ponder.config.ts`, hardcoded to Berachain id `80094`, Berachain SFLUV token, and Berachain default start block. Celo cutover still needs runtime chain/token/start-block config or a Celo-specific deployment config.
 - `ponder_hooks` and app-side Ponder subscriptions remain address-only. That is acceptable only if exactly one live Ponder chain emits hooks at a time. Dual live Berachain+Celo notification indexing would need hook/subscription chain scoping.
+- 2026-05-28 implementation update: backend Ponder-backed transaction history, historical balance, W9 paid totals, analytics transfers, analytics `transfer_account` balances, and analytics role indexing now read the reused Ponder DB as a continuity ledger instead of filtering by the active chain. Transaction rows still return `chain_id`, memo storage remains keyed by `(chain_id, tx_hash)`, and explicit memo authorization may use a supplied transaction chain id only to disambiguate a hash.
+- 2026-05-28 decimal-scale finding: Ponder stores `transfer_event.amount`, `transfer_account.balance`, allowances, hooks, W9 totals, and analytics values as raw on-chain base units. Existing Berachain rows are therefore 18-decimal units. If Celo SFLUV is deployed with 6 decimals while reusing the Ponder DB as a cross-chain continuity ledger, legacy Ponder rows must be normalized or chain/token scale must be carried through balance/history/W9/analytics queries before summing or formatting them. Otherwise a legacy `1 SFLUV` row (`1e18`) and a new Celo `1 SFLUV` row (`1e6`) will be interpreted in the same unit and reports/balances/W9 thresholds will be wrong.
+- 2026-05-28 preferred 6-decimal normalization direction: before starting Celo Ponder, transform legacy Berachain Ponder raw-unit transaction values from 18-decimal scale to 6-decimal scale by integer-dividing `transfer_event.amount` by `1e12`. Then recompute and overwrite `transfer_account.balance` from the transformed transfer events so balances remain internally consistent even if any event had truncated dust. Apply the same scale conversion to persisted app DB raw totals such as `w9_wallet_earnings.amount_received` if those cached rows are retained. Allowance tables (`allowance.amount`, `approval_event.amount`) can also be scaled for historical consistency, but they should not drive migrated Celo balances.
 
 ## Ponder Cutover Recommendation
 
@@ -90,17 +92,12 @@ If the Celo Ponder instance can safely reuse the existing Ponder DB, preserve th
 7. Start Celo Ponder with the Celo SFLUV token and `PONDER_START_BLOCK=celo_population_complete_block + 1`.
 8. Switch backend config to Celo only after the reused Ponder DB and start block are verified.
 
-Important caveat: this only works if backend/Ponder reads treat Ponder as a continuity ledger, not as independent per-chain ledgers. Current `repos/app` code has several active-chain filters:
+Continuity requirements:
 
-- `repos/app/backend/db/ponder_transactions.go` filters transaction history, historical balance, and tx-party lookup by `chain_id`.
-- `repos/app/backend/db/ponder_w9.go` filters paid W9 totals by `chain_id`.
-- `repos/app/backend/db/ponder_analytics.go` filters transfer analytics and `transfer_account` balances by `chain_id`.
-- `repos/app/ponder/ponder.schema.ts` currently has `transfer_account` keyed by `(chain_id, address)`.
-
-Before relying on continuity, align those paths:
-
-- Transaction history and W9 totals should query the reused Ponder ledger across chains unless the product explicitly asks for per-chain filtering.
-- Current/logical balances should either use address-only `transfer_account` rows, or sum all `(chain_id, address)` balance rows for the address. With chain-keyed `transfer_account`, a first Celo send from a migrated holder can create a negative Celo row, but the sum of Berachain row plus Celo row is the intended migrated-token balance.
+- Transaction history and W9 totals should query the reused Ponder ledger across chains unless the product explicitly asks for per-chain filtering. This is now implemented in backend Ponder-backed reads.
+- Current/logical balances should sum all `(chain_id, address)` `transfer_account` rows for the address. With chain-keyed `transfer_account`, a first Celo send from a migrated holder can create a negative Celo row, but the sum of Berachain row plus Celo row is the intended migrated-token balance. Analytics balance reads now do this.
+- The continuity-ledger sum assumes all indexed chains use the same token base-unit scale. If Berachain remains 18 decimals and Celo launches at 6 decimals, add an explicit decimal normalization strategy before relying on cross-chain sums.
+- If normalizing the Ponder DB in place to 6 decimals, run it while Ponder and backend writers are stopped, after final Berachain indexing and before Celo indexing begins. Snapshot the DB first and persist a transform audit artifact with row counts, total-before/after checks, non-zero remainder counts, and recomputed balance totals. Use the recomputed 6-decimal `transfer_account` balances as the source for Celo population.
 - Explicit `chain_id` remains useful metadata for explorer links, display, and any future chain-specific debugging, but it should not be required for the core Ponder balance/history lookup during this migration.
 - If we instead keep active-chain-only Ponder reads, then a separate Celo opening-balance checkpoint or seed is still required.
 

@@ -82,7 +82,8 @@ Ponder/W9 cutover note, added 2026-05-27:
 - Backfill/tag app/bot transaction records where backend verification or UI needs explicit chain metadata, but avoid operationally depending on Ponder-row retagging for the cutover.
 - Distribute Celo opening balances while Ponder is stopped or while Celo indexing is disabled.
 - Start Celo Ponder at the block after the final balance population transaction, so migration distribution transfers do not appear in user transaction history and do not trigger W9 or notification hooks.
-- Current backend code must be aligned with this model: Ponder-backed balance, history, analytics, and W9 queries should aggregate the continuity ledger across chains rather than filtering only the active chain. A checkpoint is only needed if we choose to keep chain-scoped Ponder balance reads.
+- 2026-05-28 update: backend Ponder-backed balance, history, analytics, and W9 reads now aggregate the continuity ledger across chains rather than filtering only the active chain. A checkpoint is only needed if we reintroduce chain-scoped Ponder balance reads.
+- If Celo SFLUV launches with 6 decimals, normalize legacy 18-decimal Ponder transfer amounts to 6-decimal units before Celo indexing begins, then recompute `transfer_account` balances from the transformed transfer events. Apply the same scale conversion to retained app DB raw totals such as W9 earnings. Use the recomputed 6-decimal balances for Celo population, and have the migration script audit row counts, totals, remainder counts, and recomputed balance totals.
 
 ## Phase 4: Cutover
 
