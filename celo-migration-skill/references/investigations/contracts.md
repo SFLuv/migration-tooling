@@ -65,8 +65,11 @@ Existing scripts:
 
 - `DeployMockCoin.s.sol`
 - `DeploySFLUVv2.s.sol`
+- `DeploySmartWalletBatch.s.sol`
 - `GrantSFLUVv2.s.sol`
 - `MintSFLUVv2.s.sol`
+- `SweepBeraBacking.s.sol`
+- `UpgradeToBeraWipe.s.sol`
 
 Minting currently uses approve plus `depositFor` in `contracts/script/MintSFLUVv2.s.sol:31`, `:32`, and `:34`.
 
@@ -86,3 +89,18 @@ The Celo deploy script therefore needs an external snapshot from the backend DB 
 - Build script outputs as durable artifacts: wallet snapshot, balance snapshot, deployment addresses, tx hashes, verification summary, and rollback status.
 - Use dry-run mode against forked Berachain/Celo before production broadcast.
 - Do not run Berachain wipe until Celo deployment and client cutover have been manually verified.
+
+## 2026-06-01 Wipe Split Update
+
+`SFLUVBeraWipe` is now a reversible migration-lock implementation when first upgraded:
+
+- User-facing writes revert immediately with `SFLuv has migrated to CELO.`
+- Read-only ERC20/history methods remain available.
+- Backing assets remain in the proxy until a separate `sweepBacking(treasury)` call.
+- Governance can upgrade back to an ERC20 implementation before the backing sweep if Celo migration verification fails.
+
+Scripts are split accordingly:
+
+- `UpgradeToBeraWipe.s.sol` upgrades the Berachain proxy to the lock implementation only.
+- `SweepBeraBacking.s.sol` performs the irreversible backing sweep after manual verification.
+- The older `UpgradeAndWipe.s.sol` has been changed to upgrade-only behavior so it cannot accidentally sweep backing assets during Celo distribution.

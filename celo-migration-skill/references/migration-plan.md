@@ -84,6 +84,8 @@ Ponder/W9 cutover note, added 2026-05-27:
 - Start Celo Ponder at the block after the final balance population transaction, so migration distribution transfers do not appear in user transaction history and do not trigger W9 or notification hooks.
 - 2026-05-28 update: backend Ponder-backed balance, history, analytics, and W9 reads now aggregate the continuity ledger across chains rather than filtering only the active chain. A checkpoint is only needed if we reintroduce chain-scoped Ponder balance reads.
 - If Celo SFLUV launches with 6 decimals, normalize legacy 18-decimal Ponder transfer amounts to 6-decimal units before Celo indexing begins, then recompute `transfer_account` balances from the transformed transfer events. Apply the same scale conversion to retained app DB raw totals such as W9 earnings. Use the recomputed 6-decimal balances for Celo population, and have the migration script audit row counts, totals, remainder counts, and recomputed balance totals.
+- 2026-06-01 update: the Berachain deprecation step is split. The migration script may upgrade Berachain SFLUV to a write-locking `SFLUVBeraWipe` implementation before Celo distribution, but it must not sweep backing assets during that script. The backing sweep is a separate manually executed owner-gated call after Celo balances, clients, backend config, and Ponder start block have been verified.
+- 2026-06-01 update: after writing a separate `external-holder-balances.json` artifact for non-app-wallet Ponder holders, the migration script intentionally deletes those non-app `transfer_account` balance rows from the reused Ponder DB. Those external balances are expected to be repopulated by a separate Celo migration path and normal Celo indexing, not preserved as old continuity balances.
 
 ## Phase 4: Cutover
 
@@ -102,8 +104,8 @@ After Celo deployment verifies:
 
 Only after manual verification:
 
-1. Run the Berachain wipe script.
-2. Upgrade Berachain SFLUV proxy to a deprecation implementation.
+1. Confirm Berachain SFLUV was upgraded to the migration-lock/deprecation implementation, or run the upgrade-only script if it was deferred.
+2. Run the separate Berachain backing sweep script.
 3. Sweep underlying backing ERC20s to the designated treasury/safe address.
 4. Revert all user-facing token methods with `SFLuv has migrated to CELO.`
 5. Leave read-only Berachain Ponder data available.

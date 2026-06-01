@@ -6,6 +6,8 @@ Working name: `celo-deploy-script`.
 
 Deploy SFLUV on Celo so every eligible Berachain user receives the matching Celo balance at the same smart wallet address whenever possible.
 
+Implemented orchestration script: `run-migration.sh` in the migration-tooling repo root.
+
 ## Inputs
 
 - Backend DB connection string.
@@ -38,10 +40,15 @@ Read from chain:
 - Celo smart wallet derived address for each EOA/index.
 - Celo smart wallet deployment status before migration.
 
+Pull from normalized Ponder DB:
+
+- App-linked wallet balances after 18-to-6 decimal normalization.
+- All non-zero holder balances whose addresses are not present in the app `wallets` table. Write these to a separate artifact so non-app accounts can be repopulated by a later migration step without being mixed into app-wallet deployment/distribution.
+
 ## Preflight Checks
 
-1. Confirm Celo chain id is `42220`.
-2. Confirm Berachain chain id is `80094`.
+1. Confirm each configured RPC returns a latest block. The automation intentionally does not enforce production chain IDs so local fork testing works.
+2. For production runs, manually confirm Celo chain id is `42220` and Berachain chain id is `80094`.
 3. Confirm account factory bytecode/address on Celo.
 4. For sample EOAs and indices, compare stored Berachain smart wallet address to Celo factory `getAddress(owner, index)`.
 5. Fail if any non-exception smart wallet does not match expected address.
@@ -55,19 +62,19 @@ Read from chain:
 1. Load and validate config.
 2. Query backend DB and normalize wallet records.
 3. Build unique address set for balances.
-4. Read Berachain balances at a fixed block tag if possible.
-5. Apply exception list and write final allocation plan.
-6. Deploy missing Celo smart wallets for each EOA/index.
-7. Deploy Celo SFLUV implementation and ERC1967 proxy, or temporary distribution implementation and proxy.
-8. Grant distribution/minter roles to deployer if needed.
-9. Distribute balances:
+4. Upgrade Berachain SFLUV to the reversible migration-lock implementation without sweeping backing assets.
+5. Normalize legacy 18-decimal Ponder transfer values and retained app W9 raw totals to 6 decimals, with before/after audit artifacts and DB marker rows to prevent accidental double-scaling.
+6. Recompute Ponder `transfer_account` balances from normalized transfer events.
+7. Write app-linked balance allocation and separate non-app external holder balance artifacts.
+8. Delete non-app-wallet `transfer_account` balance rows from Ponder after writing `external-holder-balances.json`; this is intentional because those holders will be repopulated by a separate Celo path and normal indexing.
+9. Deploy missing Celo smart wallets for each EOA/index.
+10. Distribute balances:
    - safest: use ERC20 mint/deposit internals that update balances and total supply coherently.
    - avoid raw storage writes unless the implementation was built for this and layout is proven.
-10. Add backing assets equal to distributed supply.
-11. If temporary distribution implementation was used, upgrade proxy to final `SFLUVv2`.
-12. Grant final roles and revoke temporary roles.
-13. Verify implementation, roles, total supply, backing balance, and sample balances.
-14. Write final artifact with tx hashes and addresses.
+11. Record `celo_distribution_complete_block`; start Celo Ponder at the following block for app-linked distribution exclusion.
+12. Verify implementation, roles, total supply, backing balance, and sample balances.
+13. Write final artifact with tx hashes and addresses.
+14. Run the separate Berachain backing sweep script only after manual verification.
 
 ## Ponder And History Cutover
 
@@ -84,6 +91,10 @@ Read from chain:
 
 - `wallet-snapshot.json`
 - `balance-snapshot.json`
+- `external-holder-balances.json`
+- `app-wallet-distribution.json`
+- `deployed-smart-wallets.json`
+- `deployed-smart-wallet-balances.json`
 - `allocation-plan.json`
 - `exceptions.json`
 - `deployment-result.json`

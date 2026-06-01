@@ -4,11 +4,13 @@ Working name: `bera-wipe-script`.
 
 ## Objective
 
-After successful Celo cutover, upgrade the Berachain SFLUV proxy to a deprecation implementation that sweeps backing assets and causes user-facing methods to revert with:
+Upgrade the Berachain SFLUV proxy to a deprecation implementation that causes user-facing methods to revert with:
 
 ```text
 SFLuv has migrated to CELO.
 ```
+
+The upgrade-only step does not sweep backing assets. The irreversible backing sweep is a separate owner-gated call that must run only after successful Celo migration verification.
 
 ## Preconditions
 
@@ -38,22 +40,24 @@ The sweep should transfer underlying ERC20 directly from the proxy context, not 
 
 1. Deploy wipe implementation on Berachain.
 2. Verify implementation bytecode/source.
-3. Simulate `upgradeToAndCall` against a fork:
+3. Simulate upgrade-only `upgradeToAndCall(address(impl), "")` against a fork:
    - upgrades proxy
-   - calls sweep initializer
-   - sends backing assets to safe
-   - leaves proxy in deprecated state
-4. Broadcast `upgradeToAndCall`.
-5. Verify:
+   - disables write methods
+   - keeps backing assets in the proxy
+   - confirms governance can still upgrade back before sweeping
+4. Broadcast the upgrade-only script.
+5. Complete and manually verify Celo wallet deployment, token distribution, client config, and Ponder start block.
+6. Simulate and then broadcast `sweepBacking(treasury)` using the separate sweep script.
+7. Verify:
    - proxy implementation slot is wipe implementation
    - backing assets moved to safe
    - transfer/deposit/withdraw paths revert with migration message
    - read-only methods needed for explorer/debugging behave as expected, if any are intentionally kept
-6. Record tx hash and final balances.
+8. Record tx hash and final balances.
 
 ## Important Risk
 
-This is the point of no return. Do not run until Celo client cutover is confirmed across all supported clients.
+The backing sweep is the point of no return. Do not run `sweepBacking` until Celo client cutover is confirmed across all supported clients. The upgrade-only lock is designed to be reversible by governance before backing assets are swept.
 
 ## Open Design Choices
 
