@@ -23,8 +23,14 @@ Configuration is loaded from the root .env by default.
 Options:
   --root-env PATH       Env file to load. Default: .env.
   --artifact-root PATH  Directory for migration artifacts. Default: migration-artifacts.
-  --run-id ID           Artifact subdirectory name. Default: UTC timestamp.
-  --dry-run             Run forge scripts without --broadcast.
+  --id ID               Call trace / artifact id. Rerunning with the same id
+                        resumes that run: steps recorded as completed in its
+                        call trace are skipped and its artifacts are kept.
+  --run-id ID           Alias for --id. Default: UTC timestamp.
+  --dry-run             Run forge scripts without --broadcast and skip all
+                        database mutations. Read-only audits and artifacts
+                        are still produced. Dry runs never mark call-trace
+                        steps as completed.
   -h, --help            Show this help.
 
 Required env:
@@ -32,7 +38,14 @@ Required env:
   MIGRATION_DB_CONNECTION_STRING, MIGRATION_DB_PONDER_SUFFIX,
   MIGRATION_DB_APP_SUFFIX, CONTRACT_DEPLOYER_PRIVATE_KEY,
   WALLET_DEPLOYER_PRIVATE_KEY, DISTRIBUTOR_PRIVATE_KEY,
-  ACCOUNT_FACTORY_ADDRESS
+  ACCOUNT_FACTORY_ADDRESS, MIGRATION_EXTRA_FUNDED_ADDRESSES
+
+MIGRATION_EXTRA_FUNDED_ADDRESSES is a comma-separated list of addresses
+outside the wallets table (service accounts such as the backend faucet)
+whose Berachain balances are retained and repopulated on Celo. Set it to
+"none" to explicitly fund only wallets-table addresses. These addresses
+are funded but not deployed: they must be EOAs (or contracts that exist
+on Celo by other means).
 USAGE
 }
 
@@ -46,7 +59,7 @@ while [[ $# -gt 0 ]]; do
       CLI_ARTIFACT_ROOT="${2:-}"
       shift 2
       ;;
-    --run-id)
+    --id|--run-id)
       CLI_RUN_ID="${2:-}"
       shift 2
       ;;
@@ -89,7 +102,11 @@ if [[ "$CLI_DRY_RUN" == "true" ]]; then
 fi
 
 ARTIFACT_DIR="$ARTIFACT_ROOT/$RUN_ID"
+TRACE_FILE="$ARTIFACT_DIR/call-trace.log"
+RUN_START_EPOCH_FILE="$ARTIFACT_DIR/run-start-epoch"
 APP_WALLETS_JSON="$ARTIFACT_DIR/app-wallets.json"
+WALLET_INTEGRITY_JSON="$ARTIFACT_DIR/wallet-integrity.json"
+EXTRA_FUNDED_ADDRESS_FILE="$ARTIFACT_DIR/extra-funded-addresses.txt"
 APP_WALLET_ADDRESS_FILE="$ARTIFACT_DIR/app-wallet-addresses.txt"
 SMART_WALLET_INPUT_JSON="$ARTIFACT_DIR/smart-wallet-deploy-input.json"
 SMART_WALLET_BATCH_DIR="$ARTIFACT_DIR/smart-wallet-batches"
@@ -242,6 +259,54 @@ psql_exec() {
   psql "$db_url" -X -q -v ON_ERROR_STOP=1 -c "$sql" >/dev/null
 }
 
+cast_scalar() {
+  local rpc="$1"
+  shift
+  cast call --rpc-url "$rpc" "$@" | awk 'NR==1{print $1}'
+}
+
+bi_ge() {
+  node -e 'process.exit(BigInt(process.argv[1]) >= BigInt(process.argv[2]) ? 0 : 1)' "$1" "$2"
+}
+
+bi_max() {
+  node -e 'const a = BigInt(process.argv[1]); const b = BigInt(process.argv[2]); process.stdout.write((a > b ? a : b).toString())' "$1" "$2"
+}
+
+bi_sub_floor_zero() {
+  node -e 'const a = BigInt(process.argv[1]); const b = BigInt(process.argv[2]); process.stdout.write((a > b ? a - b : 0n).toString())' "$1" "$2"
+}
+
+trace_step_done() {
+  [[ -f "$TRACE_FILE" ]] && grep -q "^ok ${1} " "$TRACE_FILE"
+}
+
+trace_mark_done() {
+  # Dry runs perform no onchain or DB mutations, so they must not mark steps
+  # as completed for a later real run with the same --id.
+  [[ "$MIGRATION_BROADCAST" == "true" ]] || return 0
+  printf "ok %s %s\n" "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$TRACE_FILE"
+}
+
+# run_step STEP_ID LABEL FN [ARGS...]
+# Runs FN unless STEP_ID is already recorded as completed in the call trace
+# for this run id. Completed steps are skipped so a rerun with the same --id
+# resumes exactly where the previous run failed.
+run_step() {
+  local step="$1"
+  local label="$2"
+  shift 2
+  progress_step "$label"
+  if trace_step_done "$step"; then
+    progress_skip
+    progress_info "Step '$step' already completed in call trace; skipping."
+    return 0
+  fi
+  "$@"
+  progress_ok
+  trace_mark_done "$step"
+}
+
 forge_broadcast_args=()
 if [[ "$MIGRATION_BROADCAST" == "true" ]]; then
   forge_broadcast_args=(--broadcast)
@@ -264,7 +329,8 @@ for key in \
   CONTRACT_DEPLOYER_PRIVATE_KEY \
   WALLET_DEPLOYER_PRIVATE_KEY \
   DISTRIBUTOR_PRIVATE_KEY \
-  ACCOUNT_FACTORY_ADDRESS; do
+  ACCOUNT_FACTORY_ADDRESS \
+  MIGRATION_EXTRA_FUNDED_ADDRESSES; do
   require_env "$key"
 done
 
@@ -276,11 +342,314 @@ validate_positive_int "SMART_WALLET_BATCH_SIZE" "$SMART_WALLET_BATCH_SIZE"
 APP_DB_URL="$(db_url_for "$MIGRATION_DB_CONNECTION_STRING" "$MIGRATION_DB_APP_SUFFIX")"
 PONDER_DB_URL="$(db_url_for "$MIGRATION_DB_CONNECTION_STRING" "$MIGRATION_DB_PONDER_SUFFIX")"
 DISTRIBUTOR_ADDRESS="$(private_key_address "$DISTRIBUTOR_PRIVATE_KEY")"
+CONTRACT_DEPLOYER_ADDRESS="$(private_key_address "$CONTRACT_DEPLOYER_PRIVATE_KEY")"
+WALLET_DEPLOYER_ADDRESS="$(private_key_address "$WALLET_DEPLOYER_PRIVATE_KEY")"
 
 mkdir -p "$ARTIFACT_DIR" "$SMART_WALLET_BATCH_DIR"
 
+# The first invocation for a run id pins the epoch used to filter forge
+# broadcast receipts, so a resumed run still recognizes receipts written by
+# the original invocation when resolving the completion block.
+if [[ -f "$RUN_START_EPOCH_FILE" ]]; then
+  RUN_START_EPOCH="$(tr -d '[:space:]' < "$RUN_START_EPOCH_FILE")"
+  [[ "$RUN_START_EPOCH" =~ ^[0-9]+$ ]] || die "invalid run start epoch in $RUN_START_EPOCH_FILE"
+else
+  RUN_START_EPOCH="$(date +%s)"
+  printf "%s\n" "$RUN_START_EPOCH" > "$RUN_START_EPOCH_FILE"
+fi
+
+app_wallet_address_sql() {
+  cat <<'SQL'
+WITH wallet_rows AS (
+  SELECT
+    LOWER(TRIM(eoa_address)) AS eoa_address,
+    NULLIF(LOWER(TRIM(COALESCE(smart_address, ''))), '') AS smart_address
+  FROM wallets
+),
+addresses AS (
+  SELECT eoa_address AS address
+  FROM wallet_rows
+  WHERE eoa_address ~ '^0x[0-9a-f]{40}$'
+  UNION
+  SELECT smart_address AS address
+  FROM wallet_rows
+  WHERE smart_address ~ '^0x[0-9a-f]{40}$'
+)
+SELECT address FROM addresses ORDER BY address;
+SQL
+}
+
+# Prints the configured extra funded addresses (service accounts such as the
+# backend faucet) normalized to lowercase, one per line. These addresses are
+# treated exactly like wallets-table addresses for balance retention and Celo
+# distribution, but are never deployed. "none" means explicitly empty.
+extra_funded_addresses() {
+  local raw normalized addr
+  raw="$MIGRATION_EXTRA_FUNDED_ADDRESSES"
+  normalized="$(printf "%s" "$raw" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  if [[ "$normalized" == "none" ]]; then
+    return 0
+  fi
+  for addr in ${normalized//,/ }; do
+    [[ "$addr" =~ ^0x[0-9a-f]{40}$ ]] || die "invalid address in MIGRATION_EXTRA_FUNDED_ADDRESSES: $addr"
+    printf "%s\n" "$addr"
+  done | sort -u
+}
+
+# Canonical funded-address set: wallets-table addresses plus the configured
+# extra funded addresses. Used for balance retention, the external wipe
+# boundary, and the distribution artifact.
+write_funded_address_file() {
+  local output="$1"
+  {
+    psql "$APP_DB_URL" -X -qAt -v ON_ERROR_STOP=1 -c "$(app_wallet_address_sql)"
+    extra_funded_addresses
+  } | sort -u > "$output"
+}
+
+# Returns 0 when the given DB already carries the given normalization marker.
+# Safe to call before the marker table exists.
+normalization_marker_present() {
+  local db_url="$1"
+  local marker_id="$2"
+  local marker_table_exists normalized
+
+  marker_table_exists="$(psql_scalar "$db_url" "SELECT COUNT(*) FROM pg_tables WHERE tablename = 'migration_decimal_normalization';")"
+  if [[ "$marker_table_exists" == "0" ]]; then
+    return 1
+  fi
+  normalized="$(psql_scalar "$db_url" "SELECT COUNT(*) FROM migration_decimal_normalization WHERE id = '$marker_id';")"
+  [[ "$normalized" != "0" ]]
+}
+
+# Ponder's realtime reorg triggers log every row INSERT/UPDATE/DELETE into
+# _reorg__<table> tables, and Ponder crash recovery replays that entire log in
+# reverse on the next same-build start. Our manual normalization and wipe
+# writes must not leave entries there: a later (accidental) restart of the
+# old Berachain Ponder would otherwise revert the normalized data back to raw
+# 18-decimal values. Emits TRUNCATE statements for each reorg table that
+# exists, for inclusion in the mutation transaction.
+ponder_reorg_cleanup_sql() {
+  local table exists sql=""
+  for table in transfer_event transfer_account allowance approval_event; do
+    exists="$(psql_scalar "$PONDER_DB_URL" "SELECT COUNT(*) FROM pg_tables WHERE tablename = '_reorg__$table';")"
+    if [[ "$exists" != "0" ]]; then
+      sql+="TRUNCATE _reorg__$table;"$'\n'
+    fi
+  done
+  printf "%s" "$sql"
+}
+
+# SQL expression for a transfer_event amount in 6-decimal units, applying the
+# decimal scale on the fly when the Ponder DB has not been normalized yet
+# (preflight before normalization, or a dry run that skips normalization).
+ponder_amount_expr() {
+  if normalization_marker_present "$PONDER_DB_URL" "ponder_18_to_6"; then
+    printf "amount"
+  else
+    printf "FLOOR(amount / %s)" "$DECIMAL_SCALE"
+  fi
+}
+
+# Compute the total app-wallet distribution amount (positive normalized
+# balances) without mutating anything, so funding/allowance can be verified
+# before the Berachain lock.
+preflight_projected_total() {
+  local address_file="$ARTIFACT_DIR/preflight-app-addresses.txt"
+  local amount_expr
+
+  write_funded_address_file "$address_file"
+  amount_expr="$(ponder_amount_expr)"
+
+  {
+    printf "%s\n" "CREATE TEMP TABLE preflight_app_addresses(address TEXT PRIMARY KEY);"
+    printf "%s\n" "\\copy preflight_app_addresses(address) FROM '$address_file'"
+    cat <<SQL
+WITH movements AS (
+  SELECT LOWER("from") AS address, -($amount_expr) AS delta FROM transfer_event
+  UNION ALL
+  SELECT LOWER("to") AS address, ($amount_expr) AS delta FROM transfer_event
+),
+app_balances AS (
+  SELECT m.address, SUM(m.delta) AS balance
+  FROM movements m
+  JOIN preflight_app_addresses app ON app.address = m.address
+  GROUP BY m.address
+)
+SELECT COALESCE(SUM(balance) FILTER (WHERE balance > 0), 0)::text FROM app_balances;
+SQL
+  } | psql "$PONDER_DB_URL" -X -qAt -v ON_ERROR_STOP=1 | tr -d '[:space:]'
+}
+
+# Every wallets-table row must be fundable on Celo: no silently excluded
+# addresses. Dies (with row ids in the artifact) on any row the snapshot,
+# deployment, or distribution sets would otherwise drop.
+preflight_wallet_integrity() {
+  local result critical warnings
+
+  psql_json "$APP_DB_URL" "
+WITH wallet_rows AS (
+  SELECT
+    id,
+    is_eoa,
+    smart_index,
+    LOWER(TRIM(COALESCE(eoa_address, ''))) AS eoa_address,
+    LOWER(TRIM(COALESCE(smart_address, ''))) AS smart_address
+  FROM wallets
+),
+invalid_eoa AS (
+  SELECT id FROM wallet_rows WHERE eoa_address !~ '^0x[0-9a-f]{40}$'
+),
+invalid_smart_format AS (
+  SELECT id FROM wallet_rows
+  WHERE smart_address <> '' AND smart_address !~ '^0x[0-9a-f]{40}$'
+),
+smart_missing_index AS (
+  SELECT id FROM wallet_rows
+  WHERE smart_address ~ '^0x[0-9a-f]{40}$' AND smart_index IS NULL
+),
+conflicting_smart_duplicates AS (
+  SELECT eoa_address, smart_index, COUNT(DISTINCT smart_address) AS distinct_addresses
+  FROM wallet_rows
+  WHERE smart_address ~ '^0x[0-9a-f]{40}$' AND smart_index IS NOT NULL
+  GROUP BY eoa_address, smart_index
+  HAVING COUNT(DISTINCT smart_address) > 1
+),
+non_eoa_missing_smart AS (
+  SELECT id FROM wallet_rows WHERE is_eoa = FALSE AND smart_address = ''
+)
+SELECT jsonb_pretty(jsonb_build_object(
+  'generated_at', TO_CHAR(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+  'note', 'Critical rows block the migration: they would be silently dropped from the snapshot, smart wallet deployment, or distribution sets. Fix or remove these wallet rows, then rerun.',
+  'invalid_eoa_address_rows', (SELECT COALESCE(jsonb_agg(id ORDER BY id), '[]'::jsonb) FROM invalid_eoa),
+  'invalid_smart_address_rows', (SELECT COALESCE(jsonb_agg(id ORDER BY id), '[]'::jsonb) FROM invalid_smart_format),
+  'smart_address_missing_index_rows', (SELECT COALESCE(jsonb_agg(id ORDER BY id), '[]'::jsonb) FROM smart_missing_index),
+  'conflicting_smart_duplicates', (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'eoa_address', eoa_address,
+    'smart_index', smart_index,
+    'distinct_addresses', distinct_addresses
+  ) ORDER BY eoa_address, smart_index), '[]'::jsonb) FROM conflicting_smart_duplicates),
+  'non_eoa_missing_smart_rows', (SELECT COALESCE(jsonb_agg(id ORDER BY id), '[]'::jsonb) FROM non_eoa_missing_smart)
+));" "$WALLET_INTEGRITY_JSON"
+
+  result="$(node - "$WALLET_INTEGRITY_JSON" <<'NODE'
+const fs = require("fs");
+const data = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const critical =
+  data.invalid_eoa_address_rows.length +
+  data.invalid_smart_address_rows.length +
+  data.smart_address_missing_index_rows.length +
+  data.conflicting_smart_duplicates.length;
+process.stdout.write(`${critical} ${data.non_eoa_missing_smart_rows.length}`);
+NODE
+)"
+  critical="${result%% *}"
+  warnings="${result##* }"
+
+  if [[ "$critical" != "0" ]]; then
+    progress_fail
+    die "wallets table has $critical row(s) that would be silently excluded from funding. See $WALLET_INTEGRITY_JSON"
+  fi
+  progress_ok
+  if [[ "$warnings" != "0" ]]; then
+    progress_info "$warnings non-EOA wallet row(s) have no smart_address recorded; nothing fundable for them. See $WALLET_INTEGRITY_JSON"
+  fi
+}
+
+preflight_assertions() {
+  local old_dec new_dec expected_scale underlying underlying_dec
+  local minter_role has_role projected_total total_supply remaining
+  local backing_balance backing_allowance native_balance
+  local extra_funded_count extra_funded_addr
+
+  progress_step "Wallets table integrity"
+  preflight_wallet_integrity
+
+  progress_step "Extra funded addresses"
+  extra_funded_addresses > "$EXTRA_FUNDED_ADDRESS_FILE"
+  extra_funded_count="$(grep -c . "$EXTRA_FUNDED_ADDRESS_FILE" || true)"
+  printf " %s\n" "$extra_funded_count"
+  if [[ "$extra_funded_count" != "0" ]]; then
+    while IFS= read -r extra_funded_addr; do
+      progress_info "Will retain and fund: $extra_funded_addr"
+    done < "$EXTRA_FUNDED_ADDRESS_FILE"
+  else
+    progress_info "MIGRATION_EXTRA_FUNDED_ADDRESSES=none; only wallets-table addresses are funded."
+  fi
+
+  progress_step "Old token decimals"
+  old_dec="$(cast_scalar "$OLD_CHAIN_RPC" "$OLD_TOKEN" "decimals()(uint8)")"
+  printf " %s\n" "$old_dec"
+  progress_step "New token decimals"
+  new_dec="$(cast_scalar "$NEW_CHAIN_RPC" "$NEW_TOKEN" "decimals()(uint8)")"
+  printf " %s\n" "$new_dec"
+
+  progress_step "DECIMAL_SCALE matches token decimals"
+  expected_scale="$(node -e '
+const oldDec = BigInt(process.argv[1]);
+const newDec = BigInt(process.argv[2]);
+if (oldDec < newDec) {
+  console.error("old token decimals < new token decimals is unsupported");
+  process.exit(1);
+}
+process.stdout.write((10n ** (oldDec - newDec)).toString());
+' "$old_dec" "$new_dec")" || die "unsupported token decimal combination: old=$old_dec new=$new_dec"
+  [[ "$expected_scale" == "$DECIMAL_SCALE" ]] || die "DECIMAL_SCALE is $DECIMAL_SCALE but token decimals ($old_dec -> $new_dec) require $expected_scale"
+  progress_ok
+
+  progress_step "New token underlying"
+  underlying="$(cast_scalar "$NEW_CHAIN_RPC" "$NEW_TOKEN" "underlying()(address)")"
+  printf " %s\n" "$underlying"
+  progress_step "Underlying decimals match new token"
+  underlying_dec="$(cast_scalar "$NEW_CHAIN_RPC" "$underlying" "decimals()(uint8)")"
+  [[ "$underlying_dec" == "$new_dec" ]] || die "underlying $underlying has $underlying_dec decimals but new token reports $new_dec"
+  progress_ok
+
+  progress_step "Distributor has MINTER_ROLE on new token"
+  minter_role="$(cast keccak "MINTER")"
+  has_role="$(cast_scalar "$NEW_CHAIN_RPC" "$NEW_TOKEN" "hasRole(bytes32,address)(bool)" "$minter_role" "$DISTRIBUTOR_ADDRESS")"
+  [[ "$has_role" == "true" ]] || die "distributor $DISTRIBUTOR_ADDRESS is missing MINTER_ROLE on $NEW_TOKEN"
+  progress_ok
+
+  progress_step "Deployer has DEFAULT_ADMIN_ROLE on old token"
+  has_role="$(cast_scalar "$OLD_CHAIN_RPC" "$OLD_TOKEN" "hasRole(bytes32,address)(bool)" "0x0000000000000000000000000000000000000000000000000000000000000000" "$CONTRACT_DEPLOYER_ADDRESS")"
+  [[ "$has_role" == "true" ]] || die "contract deployer $CONTRACT_DEPLOYER_ADDRESS is missing DEFAULT_ADMIN_ROLE on $OLD_TOKEN"
+  progress_ok
+
+  progress_step "Projected app distribution total"
+  projected_total="$(preflight_projected_total)"
+  printf " %s\n" "$projected_total"
+  progress_step "New token total supply (already distributed)"
+  total_supply="$(cast_scalar "$NEW_CHAIN_RPC" "$NEW_TOKEN" "totalSupply()(uint256)")"
+  printf " %s\n" "$total_supply"
+  remaining="$(bi_sub_floor_zero "$projected_total" "$total_supply")"
+  progress_info "Remaining distribution to fund: $remaining"
+
+  progress_step "Distributor backing balance covers remaining"
+  backing_balance="$(cast_scalar "$NEW_CHAIN_RPC" "$underlying" "balanceOf(address)(uint256)" "$DISTRIBUTOR_ADDRESS")"
+  bi_ge "$backing_balance" "$remaining" || die "distributor backing balance $backing_balance < remaining distribution $remaining"
+  progress_ok
+  progress_step "Distributor backing allowance covers remaining"
+  backing_allowance="$(cast_scalar "$NEW_CHAIN_RPC" "$underlying" "allowance(address,address)(uint256)" "$DISTRIBUTOR_ADDRESS" "$NEW_TOKEN")"
+  bi_ge "$backing_allowance" "$remaining" || die "distributor allowance to $NEW_TOKEN is $backing_allowance < remaining distribution $remaining"
+  progress_ok
+
+  progress_step "Contract deployer gas on old chain"
+  native_balance="$(cast balance "$CONTRACT_DEPLOYER_ADDRESS" --rpc-url "$OLD_CHAIN_RPC")"
+  [[ "$native_balance" != "0" ]] || die "contract deployer $CONTRACT_DEPLOYER_ADDRESS has no gas on the old chain"
+  printf " %s wei\n" "$native_balance"
+  progress_step "Wallet deployer gas on new chain"
+  native_balance="$(cast balance "$WALLET_DEPLOYER_ADDRESS" --rpc-url "$NEW_CHAIN_RPC")"
+  [[ "$native_balance" != "0" ]] || die "wallet deployer $WALLET_DEPLOYER_ADDRESS has no gas on the new chain"
+  printf " %s wei\n" "$native_balance"
+  progress_step "Distributor gas on new chain"
+  native_balance="$(cast balance "$DISTRIBUTOR_ADDRESS" --rpc-url "$NEW_CHAIN_RPC")"
+  [[ "$native_balance" != "0" ]] || die "distributor $DISTRIBUTOR_ADDRESS has no gas on the new chain"
+  printf " %s wei\n" "$native_balance"
+}
+
 write_app_wallet_artifacts() {
-  local app_wallet_sql smart_input_sql address_sql
+  local app_wallet_sql smart_input_sql
 
   app_wallet_sql="
 WITH wallet_rows AS (
@@ -288,6 +657,7 @@ WITH wallet_rows AS (
     id,
     owner,
     name,
+    active,
     is_eoa,
     is_hidden,
     is_redeemer,
@@ -296,7 +666,6 @@ WITH wallet_rows AS (
     NULLIF(LOWER(TRIM(COALESCE(smart_address, ''))), '') AS smart_address,
     smart_index
   FROM wallets
-  WHERE active = TRUE
 ),
 addresses AS (
   SELECT eoa_address AS address
@@ -313,8 +682,7 @@ smart_wallets AS (
     smart_index,
     smart_address
   FROM wallet_rows
-  WHERE is_eoa = FALSE
-    AND smart_index IS NOT NULL
+  WHERE smart_index IS NOT NULL
     AND eoa_address ~ '^0x[0-9a-f]{40}$'
     AND smart_address ~ '^0x[0-9a-f]{40}$'
   ORDER BY eoa_address, smart_index, id
@@ -329,6 +697,7 @@ SELECT jsonb_pretty(jsonb_build_object(
       'id', id,
       'owner', owner,
       'name', name,
+      'active', active,
       'is_eoa', is_eoa,
       'is_hidden', is_hidden,
       'is_redeemer', is_redeemer,
@@ -360,9 +729,7 @@ WITH smart_wallets AS (
     smart_index AS salt,
     LOWER(TRIM(smart_address)) AS expected_address
   FROM wallets
-  WHERE active = TRUE
-    AND is_eoa = FALSE
-    AND smart_index IS NOT NULL
+  WHERE smart_index IS NOT NULL
     AND LOWER(TRIM(eoa_address)) ~ '^0x[0-9a-f]{40}$'
     AND LOWER(TRIM(COALESCE(smart_address, ''))) ~ '^0x[0-9a-f]{40}$'
   ORDER BY LOWER(TRIM(eoa_address)), smart_index, id
@@ -373,44 +740,16 @@ SELECT jsonb_pretty(jsonb_build_object(
   'expected_addresses', COALESCE((SELECT jsonb_agg(expected_address ORDER BY owner, salt) FROM smart_wallets), '[]'::jsonb)
 ));"
 
-  address_sql="
-WITH wallet_rows AS (
-  SELECT
-    LOWER(TRIM(eoa_address)) AS eoa_address,
-    NULLIF(LOWER(TRIM(COALESCE(smart_address, ''))), '') AS smart_address
-  FROM wallets
-  WHERE active = TRUE
-),
-addresses AS (
-  SELECT eoa_address AS address
-  FROM wallet_rows
-  WHERE eoa_address ~ '^0x[0-9a-f]{40}$'
-  UNION
-  SELECT smart_address AS address
-  FROM wallet_rows
-  WHERE smart_address ~ '^0x[0-9a-f]{40}$'
-)
-SELECT address FROM addresses ORDER BY address;"
-
   psql_json "$APP_DB_URL" "$app_wallet_sql" "$APP_WALLETS_JSON"
   psql_json "$APP_DB_URL" "$smart_input_sql" "$SMART_WALLET_INPUT_JSON"
-  psql "$APP_DB_URL" -X -qAt -v ON_ERROR_STOP=1 -c "$address_sql" > "$APP_WALLET_ADDRESS_FILE"
+  write_funded_address_file "$APP_WALLET_ADDRESS_FILE"
 }
 
 normalize_app_db() {
   local before="$ARTIFACT_DIR/app-db-normalization-before.json"
   local after="$ARTIFACT_DIR/app-db-normalization-after.json"
-  local normalized
 
-  psql_exec "$APP_DB_URL" "
-CREATE TABLE IF NOT EXISTS migration_decimal_normalization (
-  id TEXT PRIMARY KEY,
-  scale NUMERIC(78, 0) NOT NULL,
-  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);"
-
-  normalized="$(psql_scalar "$APP_DB_URL" "SELECT COUNT(*) FROM migration_decimal_normalization WHERE id = 'app_w9_18_to_6';")"
-  if [[ "$normalized" != "0" ]]; then
+  if normalization_marker_present "$APP_DB_URL" "app_w9_18_to_6"; then
     progress_info "App DB decimal normalization marker already exists; leaving W9 totals unchanged."
     return 0
   fi
@@ -424,6 +763,18 @@ SELECT jsonb_pretty(jsonb_build_object(
   'remainder_total', COALESCE(SUM(MOD(amount_received, $DECIMAL_SCALE)), 0)::text
 ))
 FROM w9_wallet_earnings;" "$before"
+
+  if [[ "$MIGRATION_BROADCAST" != "true" ]]; then
+    progress_info "Dry run: W9 totals left unchanged; see $before for what would change."
+    return 0
+  fi
+
+  psql_exec "$APP_DB_URL" "
+CREATE TABLE IF NOT EXISTS migration_decimal_normalization (
+  id TEXT PRIMARY KEY,
+  scale NUMERIC(78, 0) NOT NULL,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);"
 
   psql_exec "$APP_DB_URL" "
 BEGIN;
@@ -447,17 +798,8 @@ FROM w9_wallet_earnings;" "$after"
 normalize_ponder_db() {
   local before="$ARTIFACT_DIR/ponder-normalization-before.json"
   local after="$ARTIFACT_DIR/ponder-normalization-after.json"
-  local normalized
 
-  psql_exec "$PONDER_DB_URL" "
-CREATE TABLE IF NOT EXISTS migration_decimal_normalization (
-  id TEXT PRIMARY KEY,
-  scale NUMERIC(78, 0) NOT NULL,
-  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);"
-
-  normalized="$(psql_scalar "$PONDER_DB_URL" "SELECT COUNT(*) FROM migration_decimal_normalization WHERE id = 'ponder_18_to_6';")"
-  if [[ "$normalized" != "0" ]]; then
+  if normalization_marker_present "$PONDER_DB_URL" "ponder_18_to_6"; then
     progress_info "Ponder DB decimal normalization marker already exists; leaving transaction values unchanged."
     return 0
   fi
@@ -504,6 +846,18 @@ SELECT jsonb_pretty(jsonb_build_object(
   )
 ));" "$before"
 
+  if [[ "$MIGRATION_BROADCAST" != "true" ]]; then
+    progress_info "Dry run: Ponder transaction values left unchanged; see $before for what would change."
+    return 0
+  fi
+
+  psql_exec "$PONDER_DB_URL" "
+CREATE TABLE IF NOT EXISTS migration_decimal_normalization (
+  id TEXT PRIMARY KEY,
+  scale NUMERIC(78, 0) NOT NULL,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);"
+
   psql_exec "$PONDER_DB_URL" "
 BEGIN;
 UPDATE transfer_event SET amount = FLOOR(amount / $DECIMAL_SCALE);
@@ -524,12 +878,20 @@ FROM (
 GROUP BY chain_id, address;
 
 TRUNCATE transfer_account;
+-- Per-event FLOOR can leave dust-level negative recomputed balances for
+-- emptied wallets; those are clamped to zero so the continuity ledger never
+-- reports a negative legacy balance.
 INSERT INTO transfer_account (chain_id, address, balance, is_owner)
-SELECT chain_id, address, balance, is_owner
+SELECT chain_id, address, GREATEST(balance, 0), is_owner
 FROM recomputed_transfer_account;
 
 INSERT INTO migration_decimal_normalization (id, scale)
 VALUES ('ponder_18_to_6', $DECIMAL_SCALE);
+
+-- Clear the reorg operation log entries our writes just generated (and any
+-- stale unfinalized ones), so a same-build Ponder restart cannot replay raw
+-- pre-normalization values over the normalized tables.
+$(ponder_reorg_cleanup_sql)
 COMMIT;"
 
   psql_json "$PONDER_DB_URL" "
@@ -550,6 +912,24 @@ SELECT jsonb_pretty(jsonb_build_object(
     )
     FROM transfer_account
   ),
+  'clamped_negative_balances', (
+    SELECT jsonb_build_object(
+      'note', 'Recomputed balances below zero were clamped to 0 in transfer_account. Stats exclude the zero address mint origin.',
+      'rows', COUNT(*),
+      'total_clamped_up', COALESCE(SUM(-balance), 0)::text
+    )
+    FROM (
+      SELECT SUM(delta) AS balance
+      FROM (
+        SELECT chain_id, LOWER(\"from\") AS address, -amount AS delta FROM transfer_event
+        UNION ALL
+        SELECT chain_id, LOWER(\"to\") AS address, amount AS delta FROM transfer_event
+      ) movements
+      WHERE address <> '0x0000000000000000000000000000000000000000'
+      GROUP BY chain_id, address
+      HAVING SUM(delta) < 0
+    ) negative_balances
+  ),
   'allowance', (
     SELECT jsonb_build_object(
       'rows', COUNT(*),
@@ -568,89 +948,141 @@ SELECT jsonb_pretty(jsonb_build_object(
 }
 
 write_balance_artifacts_and_wipe_external() {
-  local address_table="migration_app_wallet_addresses_$$"
-  local already_wiped
+  local already_wiped amount_expr
 
-  psql_exec "$PONDER_DB_URL" "
+  if [[ "$MIGRATION_BROADCAST" == "true" ]]; then
+    psql_exec "$PONDER_DB_URL" "
 CREATE TABLE IF NOT EXISTS migration_external_balance_wipe (
   id TEXT PRIMARY KEY,
   applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   artifact_note TEXT NOT NULL DEFAULT ''
 );"
 
-  already_wiped="$(psql_scalar "$PONDER_DB_URL" "SELECT COUNT(*) FROM migration_external_balance_wipe WHERE id = 'external_transfer_account_rows';")"
-  if [[ "$already_wiped" != "0" && "${ALLOW_EXTERNAL_BALANCE_WIPE_RERUN:-false}" != "true" ]]; then
-    die "external non-app transfer_account rows were already wiped in this Ponder DB. Use the original external-holder-balances.json artifact, or set ALLOW_EXTERNAL_BALANCE_WIPE_RERUN=true if you are intentionally rerunning against a restored DB."
+    already_wiped="$(psql_scalar "$PONDER_DB_URL" "SELECT COUNT(*) FROM migration_external_balance_wipe WHERE id = 'external_transfer_account_rows';")"
+    if [[ "$already_wiped" != "0" ]]; then
+      if [[ -f "$EXTERNAL_HOLDERS_JSON" && -f "$APP_DISTRIBUTION_JSON" && -f "$EXTERNAL_WIPE_AUDIT_JSON" ]]; then
+        progress_info "External wipe already applied; keeping existing artifacts for run id $RUN_ID."
+        return 0
+      fi
+      if [[ "${ALLOW_EXTERNAL_BALANCE_WIPE_RERUN:-false}" != "true" ]]; then
+        die "external non-app transfer_account rows were already wiped in this Ponder DB, but run id $RUN_ID has no external-holder artifacts. Resume with the original --id, use the original external-holder-balances.json artifact, or set ALLOW_EXTERNAL_BALANCE_WIPE_RERUN=true if you are intentionally rerunning against a restored DB."
+      fi
+    fi
   fi
 
-  psql_exec "$PONDER_DB_URL" "DROP TABLE IF EXISTS $address_table; CREATE TABLE $address_table(address TEXT PRIMARY KEY);"
-  psql "$PONDER_DB_URL" -X -q -v ON_ERROR_STOP=1 -c "\\copy $address_table(address) FROM '$APP_WALLET_ADDRESS_FILE'" >/dev/null
+  amount_expr="$(ponder_amount_expr)"
 
-  psql_json "$PONDER_DB_URL" "
-WITH external AS (
-  SELECT LOWER(address) AS address, SUM(balance) AS balance
-  FROM transfer_account ta
+  # Balance artifacts are derived from transfer events (clamped per chain and
+  # address, exactly like the transfer_account recompute) so they are correct
+  # both in real runs and in dry runs where normalization was skipped. The
+  # whole block runs in one psql session: the address list lives in a TEMP
+  # table, and in real runs the delete plus its wipe marker commit atomically
+  # as a single statement.
+  {
+    printf '%s\n' "CREATE TEMP TABLE migration_app_wallet_addresses(address TEXT PRIMARY KEY);"
+    printf '%s\n' "\\copy migration_app_wallet_addresses(address) FROM '$APP_WALLET_ADDRESS_FILE'"
+    printf '%s\n' "\\o $EXTERNAL_HOLDERS_JSON"
+    cat <<SQL
+WITH movements AS (
+  SELECT chain_id, LOWER("from") AS address, -($amount_expr) AS delta FROM transfer_event
+  UNION ALL
+  SELECT chain_id, LOWER("to") AS address, ($amount_expr) AS delta FROM transfer_event
+),
+chain_balances AS (
+  SELECT chain_id, address, GREATEST(SUM(delta), 0) AS balance
+  FROM movements
+  GROUP BY chain_id, address
+),
+external AS (
+  SELECT cb.address, SUM(cb.balance) AS balance
+  FROM chain_balances cb
   WHERE NOT EXISTS (
-    SELECT 1 FROM $address_table app WHERE app.address = LOWER(ta.address)
+    SELECT 1 FROM migration_app_wallet_addresses app WHERE app.address = cb.address
   )
-  GROUP BY LOWER(address)
-  HAVING SUM(balance) > 0
+  GROUP BY cb.address
+  HAVING SUM(cb.balance) > 0
 )
 SELECT jsonb_pretty(jsonb_build_object(
-  'generated_at', TO_CHAR(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-  'note', 'Positive normalized Ponder balances for holders not present in app.wallets. These transfer_account rows are deleted from Ponder after this artifact is written.',
+  'generated_at', TO_CHAR(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+  'note', 'Positive normalized balances derived from Ponder transfer events for holders not present in app.wallets and not in the configured extra funded addresses. In a real run the corresponding transfer_account rows are deleted from Ponder after this artifact is written.',
   'addresses', COALESCE((SELECT jsonb_agg(address ORDER BY address) FROM external), '[]'::jsonb),
   'amounts', COALESCE((SELECT jsonb_agg(balance::text ORDER BY address) FROM external), '[]'::jsonb),
   'holders', COALESCE((
     SELECT jsonb_agg(jsonb_build_object('address', address, 'balance', balance::text) ORDER BY address)
     FROM external
   ), '[]'::jsonb)
-));" "$EXTERNAL_HOLDERS_JSON"
-
-  psql_json "$PONDER_DB_URL" "
-WITH app_balances AS (
-  SELECT LOWER(ta.address) AS address, SUM(ta.balance) AS balance
-  FROM transfer_account ta
-  JOIN $address_table app ON app.address = LOWER(ta.address)
-  GROUP BY LOWER(ta.address)
-  HAVING SUM(ta.balance) > 0
+));
+SQL
+    printf '%s\n' "\\o $APP_DISTRIBUTION_JSON"
+    cat <<SQL
+WITH movements AS (
+  SELECT chain_id, LOWER("from") AS address, -($amount_expr) AS delta FROM transfer_event
+  UNION ALL
+  SELECT chain_id, LOWER("to") AS address, ($amount_expr) AS delta FROM transfer_event
+),
+chain_balances AS (
+  SELECT chain_id, address, GREATEST(SUM(delta), 0) AS balance
+  FROM movements
+  GROUP BY chain_id, address
+),
+app_balances AS (
+  SELECT cb.address, SUM(cb.balance) AS balance
+  FROM chain_balances cb
+  JOIN migration_app_wallet_addresses app ON app.address = cb.address
+  GROUP BY cb.address
+  HAVING SUM(cb.balance) > 0
 )
 SELECT jsonb_pretty(jsonb_build_object(
-  'generated_at', TO_CHAR(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-  'note', 'Desired final Celo SFLUV balances for addresses present in app.wallets after 6-decimal normalization.',
+  'generated_at', TO_CHAR(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+  'note', 'Desired final Celo SFLUV balances after 6-decimal normalization for addresses present in app.wallets plus the configured extra funded addresses (service accounts such as the backend faucet).',
   'addresses', COALESCE((SELECT jsonb_agg(address ORDER BY address) FROM app_balances), '[]'::jsonb),
   'amounts', COALESCE((SELECT jsonb_agg(balance::text ORDER BY address) FROM app_balances), '[]'::jsonb),
   'holders', COALESCE((
     SELECT jsonb_agg(jsonb_build_object('address', address, 'balance', balance::text) ORDER BY address)
     FROM app_balances
   ), '[]'::jsonb)
-));" "$APP_DISTRIBUTION_JSON"
-
-  psql_json "$PONDER_DB_URL" "
+));
+SQL
+    if [[ "$MIGRATION_BROADCAST" == "true" ]]; then
+      printf '%s\n' "\\o $EXTERNAL_WIPE_AUDIT_JSON"
+      printf '%s\n' "BEGIN;"
+      cat <<SQL
 WITH deleted AS (
   DELETE FROM transfer_account ta
   WHERE NOT EXISTS (
-    SELECT 1 FROM $address_table app WHERE app.address = LOWER(ta.address)
+    SELECT 1 FROM migration_app_wallet_addresses app WHERE app.address = LOWER(ta.address)
   )
   RETURNING balance
+),
+wipe_marker AS (
+  INSERT INTO migration_external_balance_wipe (id, artifact_note)
+  VALUES ('external_transfer_account_rows', 'External holder artifact written before deleting non-app transfer_account rows.')
+  ON CONFLICT (id) DO UPDATE
+  SET applied_at = NOW(),
+      artifact_note = EXCLUDED.artifact_note
 )
 SELECT jsonb_pretty(jsonb_build_object(
-  'generated_at', TO_CHAR(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+  'generated_at', TO_CHAR(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
   'deleted_transfer_account_rows', COUNT(*),
   'deleted_positive_rows', COUNT(*) FILTER (WHERE balance > 0),
   'deleted_positive_balance_total', COALESCE(SUM(balance) FILTER (WHERE balance > 0), 0)::text,
   'note', 'Non-app-wallet transfer_account rows were removed intentionally. Do not recompute transfer_account from legacy Berachain transfer_event rows after this point.'
 ))
-FROM deleted;" "$EXTERNAL_WIPE_AUDIT_JSON"
+FROM deleted;
+SQL
+      printf '%s\n' "\\o"
+      # Clear the reorg log entries the DELETE just generated, in the same
+      # transaction, so a same-build Ponder restart cannot re-insert the
+      # wiped external rows.
+      printf '%s\n' "$(ponder_reorg_cleanup_sql)"
+      printf '%s\n' "COMMIT;"
+    fi
+    printf '%s\n' "\\o"
+  } | psql "$PONDER_DB_URL" -X -qAt -v ON_ERROR_STOP=1 >/dev/null
 
-  psql_exec "$PONDER_DB_URL" "
-INSERT INTO migration_external_balance_wipe (id, artifact_note)
-VALUES ('external_transfer_account_rows', 'External holder artifact written before deleting non-app transfer_account rows.')
-ON CONFLICT (id) DO UPDATE
-SET applied_at = NOW(),
-    artifact_note = EXCLUDED.artifact_note;"
-
-  psql_exec "$PONDER_DB_URL" "DROP TABLE IF EXISTS $address_table;"
+  if [[ "$MIGRATION_BROADCAST" != "true" ]]; then
+    progress_info "Dry run: external transfer_account rows left in place; no wipe marker written."
+  fi
 }
 
 merge_smart_wallet_batches() {
@@ -661,7 +1093,9 @@ const path = require("path");
 const [inputPath, batchDir, outputPath] = process.argv.slice(2);
 const input = JSON.parse(fs.readFileSync(inputPath, "utf8"));
 const batchFiles = fs.existsSync(batchDir)
-  ? fs.readdirSync(batchDir).filter((name) => /^batch-\d+\.json$/.test(name)).sort()
+  ? fs.readdirSync(batchDir)
+      .filter((name) => /^batch-\d+\.json$/.test(name))
+      .sort((a, b) => Number(a.match(/\d+/)[0]) - Number(b.match(/\d+/)[0]))
   : [];
 
 const rows = [];
@@ -717,6 +1151,40 @@ fs.writeFileSync(outputPath, `${JSON.stringify({
 NODE
 }
 
+# Highest block number across forge broadcast receipts written by this run,
+# so the Ponder start block is derived from the actual distribution
+# transactions rather than a possibly-lagging RPC head.
+max_broadcast_block() {
+  node - "$CONTRACTS_DIR/broadcast" "$RUN_START_EPOCH" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const [root, sinceRaw] = process.argv.slice(2);
+const since = Number(sinceRaw);
+let max = 0n;
+for (const script of ["DeploySmartWalletBatch.s.sol", "DistributeBatch.s.sol"]) {
+  const scriptDir = path.join(root, script);
+  if (!fs.existsSync(scriptDir)) continue;
+  for (const chainDir of fs.readdirSync(scriptDir)) {
+    const file = path.join(scriptDir, chainDir, "run-latest.json");
+    if (!fs.existsSync(file)) continue;
+    let data;
+    try {
+      data = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch {
+      continue;
+    }
+    if (Number(data.timestamp || 0) < since) continue;
+    for (const receipt of data.receipts || []) {
+      if (receipt.blockNumber === undefined || receipt.blockNumber === null) continue;
+      const block = BigInt(receipt.blockNumber);
+      if (block > max) max = block;
+    }
+  }
+}
+process.stdout.write(max.toString());
+NODE
+}
+
 write_result_json() {
   local celo_block="$1"
   node - "$MIGRATION_RESULT_JSON" "$ARTIFACT_DIR" "$celo_block" "$OLD_TOKEN" "$NEW_TOKEN" "$APP_DISTRIBUTION_JSON" "$EXTERNAL_HOLDERS_JSON" <<'NODE'
@@ -737,9 +1205,62 @@ fs.writeFileSync(outputPath, `${JSON.stringify({
 NODE
 }
 
+backup_app_db() {
+  pg_dump --format=custom --no-owner --no-acl "$APP_DB_URL" -f "$ARTIFACT_DIR/app-db-before.dump"
+}
+
+backup_ponder_db() {
+  pg_dump --format=custom --no-owner --no-acl "$PONDER_DB_URL" -f "$ARTIFACT_DIR/ponder-db-before.dump"
+}
+
+upgrade_bera_lock() {
+  (
+    cd "$CONTRACTS_DIR"
+    SFLUV_V2_PROXY="$OLD_TOKEN" forge script script/UpgradeToBeraWipe.s.sol:UpgradeToBeraWipe \
+      --rpc-url "$OLD_CHAIN_RPC" \
+      --private-key "$CONTRACT_DEPLOYER_PRIVATE_KEY" \
+      "${forge_broadcast_args[@]}"
+  )
+}
+
+deploy_smart_wallet_batch() {
+  local start="$1"
+  local batch_file="$SMART_WALLET_BATCH_DIR/batch-$start.json"
+  (
+    cd "$CONTRACTS_DIR"
+    ACCOUNT_FACTORY_ADDRESS="$ACCOUNT_FACTORY_ADDRESS" forge script script/DeploySmartWalletBatch.s.sol:DeploySmartWalletBatch \
+      --sig "run(string,uint256,uint256,string)" "$SMART_WALLET_INPUT_JSON" "$start" "$SMART_WALLET_BATCH_SIZE" "$batch_file" \
+      --rpc-url "$NEW_CHAIN_RPC" \
+      --private-key "$WALLET_DEPLOYER_PRIVATE_KEY" \
+      "${forge_broadcast_args[@]}"
+  )
+}
+
+distribute_app_wallets() {
+  (
+    cd "$CONTRACTS_DIR"
+    SFLUV_V3_PROXY="$NEW_TOKEN" DISTRIBUTOR="$DISTRIBUTOR_ADDRESS" forge script script/DistributeBatch.s.sol:DistributeBatch \
+      --sig "run(string)" "$APP_DISTRIBUTION_JSON" \
+      --rpc-url "$NEW_CHAIN_RPC" \
+      --private-key "$DISTRIBUTOR_PRIVATE_KEY" \
+      "${forge_broadcast_args[@]}"
+  )
+}
+
+completion_write_result() {
+  local chain_head broadcast_max celo_block
+  chain_head="$(cast block-number --rpc-url "$NEW_CHAIN_RPC")"
+  broadcast_max="$(max_broadcast_block)"
+  celo_block="$(bi_max "$chain_head" "$broadcast_max")"
+  progress_info "Chain head: $chain_head; max broadcast receipt block: $broadcast_max; using: $celo_block"
+  write_result_json "$celo_block"
+}
+
 print_phase "Preflight"
 progress_step "Artifact directory"
 printf " %s\n" "$ARTIFACT_DIR"
+progress_step "Call trace"
+printf " %s\n" "$TRACE_FILE"
 
 verify_rpc_get_block "Old RPC latest block" "$OLD_CHAIN_RPC"
 verify_rpc_get_block "New RPC latest block" "$NEW_CHAIN_RPC"
@@ -749,45 +1270,28 @@ psql "$APP_DB_URL" -X -qAt -v ON_ERROR_STOP=1 -c "SELECT 1;" >/dev/null
 psql "$PONDER_DB_URL" -X -qAt -v ON_ERROR_STOP=1 -c "SELECT 1;" >/dev/null
 progress_ok
 
+print_phase "Preflight Assertions"
+preflight_assertions
+
 print_phase "Database Backups"
-progress_step "Dump app DB"
-pg_dump --format=custom --no-owner --no-acl "$APP_DB_URL" -f "$ARTIFACT_DIR/app-db-before.dump"
-progress_ok
-progress_step "Dump Ponder DB"
-pg_dump --format=custom --no-owner --no-acl "$PONDER_DB_URL" -f "$ARTIFACT_DIR/ponder-db-before.dump"
-progress_ok
+run_step "backup_app_db" "Dump app DB" backup_app_db
+run_step "backup_ponder_db" "Dump Ponder DB" backup_ponder_db
 
 print_phase "Berachain Migration Lock"
-progress_step "Upgrade old token to wipe implementation"
-(
-  cd "$CONTRACTS_DIR"
-  SFLUV_V2_PROXY="$OLD_TOKEN" forge script script/UpgradeToBeraWipe.s.sol:UpgradeToBeraWipe \
-    --rpc-url "$OLD_CHAIN_RPC" \
-    --private-key "$CONTRACT_DEPLOYER_PRIVATE_KEY" \
-    "${forge_broadcast_args[@]}"
-)
-progress_ok
+run_step "bera_lock_upgrade" "Upgrade old token to wipe implementation" upgrade_bera_lock
 
 print_phase "Wallet Snapshot"
-progress_step "Write app wallet artifacts"
-write_app_wallet_artifacts
-progress_ok
+run_step "wallet_snapshot" "Write app wallet artifacts" write_app_wallet_artifacts
 progress_info "Wallet snapshot: $APP_WALLETS_JSON"
 progress_info "Smart deploy input: $SMART_WALLET_INPUT_JSON"
 
 print_phase "Decimal Normalization"
-progress_step "Normalize app W9 totals"
-normalize_app_db
-progress_ok
-progress_step "Normalize Ponder transaction values"
-normalize_ponder_db
-progress_ok
+run_step "normalize_app_w9" "Normalize app W9 totals" normalize_app_db
+run_step "normalize_ponder" "Normalize Ponder transaction values" normalize_ponder_db
 progress_info "App business amounts such as workflow bounties and proposer balances are left unchanged; they are treated as already normalized app-level token amounts."
 
 print_phase "Balance Artifacts"
-progress_step "Write app/external balances and wipe external Ponder balances"
-write_balance_artifacts_and_wipe_external
-progress_ok
+run_step "balance_artifacts_external_wipe" "Write app/external balances and wipe external Ponder balances" write_balance_artifacts_and_wipe_external
 progress_info "App distribution: $APP_DISTRIBUTION_JSON"
 progress_info "External holders: $EXTERNAL_HOLDERS_JSON"
 
@@ -800,17 +1304,7 @@ if [[ "$SMART_WALLET_COUNT" -eq 0 ]]; then
 else
   start=0
   while [[ "$start" -lt "$SMART_WALLET_COUNT" ]]; do
-    batch_file="$SMART_WALLET_BATCH_DIR/batch-$start.json"
-    progress_step "Deploy smart wallets $start"
-    (
-      cd "$CONTRACTS_DIR"
-      ACCOUNT_FACTORY_ADDRESS="$ACCOUNT_FACTORY_ADDRESS" forge script script/DeploySmartWalletBatch.s.sol:DeploySmartWalletBatch \
-        --sig "run(string,uint256,uint256,string)" "$SMART_WALLET_INPUT_JSON" "$start" "$SMART_WALLET_BATCH_SIZE" "$batch_file" \
-        --rpc-url "$NEW_CHAIN_RPC" \
-        --private-key "$WALLET_DEPLOYER_PRIVATE_KEY" \
-        "${forge_broadcast_args[@]}"
-    )
-    progress_ok
+    run_step "smart_wallet_batch_$start" "Deploy smart wallets $start" deploy_smart_wallet_batch "$start"
     start="$((start + SMART_WALLET_BATCH_SIZE))"
   done
   merge_smart_wallet_batches
@@ -825,23 +1319,12 @@ if [[ "$APP_DISTRIBUTION_COUNT" -eq 0 ]]; then
   progress_step "Distribute app wallet balances"
   progress_skip
 else
-  progress_step "Distribute app wallet balances"
-  (
-    cd "$CONTRACTS_DIR"
-    SFLUV_V3_PROXY="$NEW_TOKEN" DISTRIBUTOR="$DISTRIBUTOR_ADDRESS" forge script script/DistributeBatch.s.sol:DistributeBatch \
-      --sig "run(string)" "$APP_DISTRIBUTION_JSON" \
-      --rpc-url "$NEW_CHAIN_RPC" \
-      --private-key "$DISTRIBUTOR_PRIVATE_KEY" \
-      "${forge_broadcast_args[@]}"
-  )
-  progress_ok
+  run_step "distribute_app_balances" "Distribute app wallet balances" distribute_app_wallets
 fi
 
 print_phase "Completion"
-progress_step "Read Celo block"
-CELO_COMPLETE_BLOCK="$(cast block-number --rpc-url "$NEW_CHAIN_RPC")"
-printf " %s\n" "$CELO_COMPLETE_BLOCK"
-write_result_json "$CELO_COMPLETE_BLOCK"
+run_step "write_migration_result" "Resolve Celo completion block" completion_write_result
+CELO_COMPLETE_BLOCK="$(node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).celo_distribution_complete_block' "$MIGRATION_RESULT_JSON")"
 
 cat <<SUMMARY
 

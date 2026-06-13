@@ -47,6 +47,14 @@ Pull from normalized Ponder DB:
 
 ## Preflight Checks
 
+Implemented in `run-migration.sh` as of 2026-06-12 (`Preflight Assertions` phase, all before the Berachain lock):
+
+- Old/new token `decimals()` are read onchain and `DECIMAL_SCALE` must equal `10^(old - new)`.
+- New token `underlying()` must exist and report the same decimals as the new token.
+- Distributor must hold `MINTER_ROLE` on the new token; contract deployer must hold `DEFAULT_ADMIN_ROLE` on the old token.
+- Projected app distribution total is computed read-only from Ponder transfer events (scale applied on the fly if not yet normalized); distributor backing balance and allowance must cover `projected_total - newToken.totalSupply()`.
+- Contract deployer (old chain), wallet deployer, and distributor (new chain) must have nonzero gas balances.
+
 1. Confirm each configured RPC returns a latest block. The automation intentionally does not enforce production chain IDs so local fork testing works.
 2. For production runs, manually confirm Celo chain id is `42220` and Berachain chain id is `80094`.
 3. Confirm account factory bytecode/address on Celo.
@@ -78,14 +86,16 @@ Pull from normalized Ponder DB:
 
 ## Ponder And History Cutover
 
-1. Before the onchain migration, pause Berachain SFLUV user activity and wait for Berachain Ponder to index through the final paused block.
-2. Stop the Berachain Ponder process.
-3. Reuse the existing Ponder DB for the Celo Ponder instance if validation confirms Ponder can safely continue from the existing schema/state.
-4. Run the Celo balance population with Ponder stopped or with Celo indexing disabled.
-5. Record `celo_population_complete_block` and `celo_population_complete_timestamp` in the deployment artifact.
-6. Start Celo Ponder at `celo_population_complete_block + 1`.
+Revised 2026-06-12: the Celo Ponder instance runs against its own dedicated database (Ponder refuses to start against a schema owned by a different build id — see open-questions.md). The Berachain DB is normalized in place and its history is then backfilled into the Celo DB, which becomes the single cross-chain continuity ledger the backend reads.
+
+1. Before the onchain migration, pause Berachain SFLUV user activity, **manually verify the token is paused/locked correctly**, and wait for Berachain Ponder to index through the final paused block. This verification is an operator responsibility; the migration script does not gate on it.
+2. Stop the Berachain Ponder process. Never restart it against the normalized DB (same-build crash recovery would replay stale 18-decimal reorg rows).
+3. Run `run-migration.sh` (normalizes the legacy Ponder DB, wipes external balances, deploys wallets, distributes on Celo).
+4. Create the dedicated Celo Ponder database (`MIGRATION_DB_CELO_PONDER_SUFFIX`) and boot the Celo Ponder instance against it with `PONDER_START_BLOCK = celo_distribution_complete_block + 1` so it creates its tables and goes live. Set `PONDER_CHAIN_ID=42220` on that instance: `src/index.ts` reads `context.chain.id` (fixed 2026-06-12 — Ponder 0.15 renamed `context.network`, so the old read always fell back to env/80094) with the env value as fallback, and a wrong chain id would tag every Celo row as Berachain and corrupt the ledger.
+5. Run `backfill-bera-history.sh` to copy the normalized Berachain rows (`transfer_event`, `transfer_account`, `allowance`, `approval_event`) into the Celo Ponder DB. It refuses to run unless the source carries both the normalization and external-wipe markers, inserts with `ON CONFLICT DO NOTHING` (idempotent), and dies on any row-count or value-total mismatch. Ponder's reorg triggers log every insert into `_reorg__*` tables and crash recovery replays that log in reverse, so each table copy deletes its Berachain-tagged reorg-log entries in the same transaction — that cleanup is what makes the backfill safe to run while Celo Ponder is live.
+6. Point backend Ponder reads at the Celo Ponder DB; continuity queries sum across `(chain_id, address)` rows as already implemented.
 7. Verify continuity-ledger behavior: Ponder-derived balances equal Celo onchain balances, transaction history excludes distribution txs, and W9 totals include real paid activity across chains without counting migration distribution.
-8. If backend/Ponder reads remain active-chain scoped, stop and seed an opening-balance checkpoint or adjust reads before enabling user traffic.
+8. Keep the legacy Berachain Ponder DB as a read-only archive.
 
 ## Required Artifacts
 
@@ -112,9 +122,25 @@ Each artifact should include:
 
 ## Failure Handling
 
-- Before token distribution: fix config/deployer/factory issue and rerun from artifact.
+- `run-migration.sh` keeps a per-run call trace (`call-trace.log` in the artifact dir, 2026-06-12). Each completed step (backups, lock upgrade, snapshot, normalizations, external wipe, each smart wallet batch, distribution, completion) is recorded. Rerunning with the same `--id` resumes exactly where the previous run failed: completed steps are skipped and their artifacts (including the pre-mutation DB dumps and the original `external-holder-balances.json`) are preserved, never recomputed or overwritten.
+- The external-balance delete and its DB marker commit atomically in one statement; if the marker exists but the run id has no external artifacts, the script refuses to proceed and points the operator at the original `--id` (`ALLOW_EXTERNAL_BALANCE_WIPE_RERUN=true` remains the explicit escape hatch for restored DBs).
+- Before token distribution: fix config/deployer/factory issue and rerun with the same `--id`.
 - During distribution: rerun idempotently by calculating remaining desired balance per address.
 - After final upgrade: do not rerun blindly; compare verification report and use targeted repair script.
+
+## Script Behavior Decisions (2026-06-12)
+
+- All `wallets` rows are funded — the `active = TRUE` and `is_eoa = FALSE` filters were removed from the snapshot, smart-wallet deployment, and distribution sets. Deactivating a wallet row must not strand its onchain funds, and any row with a valid `smart_address` plus `smart_index` is deployed regardless of `is_eoa`. The snapshot relies strictly on the `wallets` table (location/payment/primary address columns elsewhere are not snapshot inputs).
+- `MIGRATION_EXTRA_FUNDED_ADDRESSES` (required env, 2026-06-12) names service-account addresses outside the `wallets` table whose Berachain balances are retained in the continuity ledger and repopulated on Celo — currently the backend faucet/bot address. The list joins the funded-address set everywhere (external-wipe boundary, distribution artifact, projected-total funding check) and is echoed in preflight plus `extra-funded-addresses.txt`. These addresses are funded but never deployed, so they must be EOAs. Set to `none` to explicitly fund only wallets-table addresses; the env being required prevents forgetting the faucet. Add future service accounts to this list.
+- A `Wallets table integrity` preflight dies (with row ids in `wallet-integrity.json`) on any row that would otherwise be silently excluded: malformed `eoa_address`, malformed `smart_address`, valid `smart_address` with NULL `smart_index`, or duplicate `(eoa_address, smart_index)` pairs with conflicting smart addresses. Non-EOA rows with no `smart_address` at all are reported as warnings (nothing fundable for them).
+- `--dry-run` is fully dry: it skips the W9 normalization, Ponder normalization/recompute, and the external balance wipe (in addition to forge `--broadcast`), and never marks call-trace steps as completed. Balance artifacts are derived from transfer events with the decimal scale applied on the fly, so dry-run artifacts match what a real run would produce.
+
+- Recomputed Ponder `transfer_account` balances are clamped to zero: per-event FLOOR can leave dust-level negative balances for emptied wallets, and the continuity ledger must never report a negative legacy balance. Clamp stats (rows, total clamped up, excluding the zero address) are written to the ponder-normalization-after artifact.
+- `celo_distribution_complete_block` is `max(chain head, highest block across forge broadcast receipts written by this run)` so a lagging load-balanced RPC head can never place the Ponder start block at or before the distribution transactions.
+- Non-app external holder balances are intentionally deleted and not auto-migrated: some external account setups would lose keys or switch accounts cross-chain, and funds must not be locked into unrecoverable Celo accounts. Externals are handled by a separate, manual path from `external-holder-balances.json`.
+- The backend is assumed to be shut down for the whole migration window; backend chain config and `TOKEN_DECIMALS` are redefined manually before it boots against Celo. The script intentionally does not enforce a maintenance mode.
+- The Ponder normalization and external-wipe transactions truncate the `_reorg__*` operation-log tables they touch (second-pass fix, 2026-06-12). The manual `UPDATE`/`INSERT`/`DELETE` statements fire Ponder's reorg triggers (cloned with the prod DB), and a same-build restart of the old Berachain Ponder replays that log in reverse — without the cleanup it would revert the normalized tables back to raw 18-decimal values. With it, an accidental restart finds an empty log and reverts nothing.
+- The forge-broadcast epoch used to filter `run-latest.json` receipts for the completion block is pinned in `run-start-epoch` inside the artifact dir on the first invocation, so a resumed run still recognizes receipts written by the original invocation.
 
 ## Verification Checklist
 
