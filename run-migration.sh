@@ -36,9 +36,14 @@ Options:
 Required env:
   OLD_CHAIN_RPC, NEW_CHAIN_RPC, OLD_TOKEN, NEW_TOKEN,
   MIGRATION_DB_CONNECTION_STRING, MIGRATION_DB_PONDER_SUFFIX,
-  MIGRATION_DB_APP_SUFFIX, CONTRACT_DEPLOYER_PRIVATE_KEY,
+  MIGRATION_DB_APP_SUFFIX, MIGRATION_DB_BOT_SUFFIX,
+  CONTRACT_DEPLOYER_PRIVATE_KEY,
   WALLET_DEPLOYER_PRIVATE_KEY, DISTRIBUTOR_PRIVATE_KEY,
   ACCOUNT_FACTORY_ADDRESS, MIGRATION_EXTRA_FUNDED_ADDRESSES
+
+MIGRATION_DB_BOT_SUFFIX is the bot database that holds recovery_balances; the
+non-app external holder balances are seeded there for post-migration recovery
+claims.
 
 MIGRATION_EXTRA_FUNDED_ADDRESSES is a comma-separated list of addresses
 outside the wallets table (service accounts such as the backend faucet)
@@ -326,6 +331,7 @@ for key in \
   MIGRATION_DB_CONNECTION_STRING \
   MIGRATION_DB_PONDER_SUFFIX \
   MIGRATION_DB_APP_SUFFIX \
+  MIGRATION_DB_BOT_SUFFIX \
   CONTRACT_DEPLOYER_PRIVATE_KEY \
   WALLET_DEPLOYER_PRIVATE_KEY \
   DISTRIBUTOR_PRIVATE_KEY \
@@ -341,6 +347,7 @@ validate_positive_int "SMART_WALLET_BATCH_SIZE" "$SMART_WALLET_BATCH_SIZE"
 
 APP_DB_URL="$(db_url_for "$MIGRATION_DB_CONNECTION_STRING" "$MIGRATION_DB_APP_SUFFIX")"
 PONDER_DB_URL="$(db_url_for "$MIGRATION_DB_CONNECTION_STRING" "$MIGRATION_DB_PONDER_SUFFIX")"
+BOT_DB_URL="$(db_url_for "$MIGRATION_DB_CONNECTION_STRING" "$MIGRATION_DB_BOT_SUFFIX")"
 DISTRIBUTOR_ADDRESS="$(private_key_address "$DISTRIBUTOR_PRIVATE_KEY")"
 CONTRACT_DEPLOYER_ADDRESS="$(private_key_address "$CONTRACT_DEPLOYER_PRIVATE_KEY")"
 WALLET_DEPLOYER_ADDRESS="$(private_key_address "$WALLET_DEPLOYER_PRIVATE_KEY")"
@@ -1085,6 +1092,55 @@ SQL
   fi
 }
 
+# Seed the bot DB recovery_balances table from the external-holder artifact so
+# non-auto-migrated holders (mostly Citizen Wallet users) can claim their
+# decimal-adjusted balances after the migration. The external-holder query
+# already excludes app wallets and the configured extra funded addresses (the
+# faucet), so faucet/auto-migrated balances are never added to the recovery
+# list. Idempotent: ON CONFLICT keeps any already-claimed rows untouched.
+seed_recovery_balances() {
+  if [[ "$MIGRATION_BROADCAST" != "true" ]]; then
+    progress_info "Dry run: skipping recovery_balances seeding (no DB writes)."
+    return 0
+  fi
+  [[ -f "$EXTERNAL_HOLDERS_JSON" ]] || die "external holder artifact missing: $EXTERNAL_HOLDERS_JSON"
+
+  local old_chain_id csv
+  old_chain_id="$(cast chain-id --rpc-url "$OLD_CHAIN_RPC")"
+  [[ "$old_chain_id" =~ ^[0-9]+$ ]] || die "could not resolve old chain id from $OLD_CHAIN_RPC"
+  csv="$ARTIFACT_DIR/recovery-balances.csv"
+
+  node - "$EXTERNAL_HOLDERS_JSON" "$old_chain_id" "$csv" <<'NODE'
+const fs = require("fs");
+const [artifact, chainId, out] = process.argv.slice(2);
+const data = JSON.parse(fs.readFileSync(artifact, "utf8"));
+const holders = data.holders || [];
+const lines = [];
+for (const h of holders) {
+  const addr = String(h.address || "").toLowerCase().trim();
+  const amt = String(h.balance || "0").trim();
+  if (!/^0x[0-9a-f]{40}$/.test(addr)) continue;
+  if (!/^[0-9]+$/.test(amt) || amt === "0") continue;
+  lines.push(`${addr},${chainId},${amt}`);
+}
+fs.writeFileSync(out, lines.length ? lines.join("\n") + "\n" : "");
+NODE
+
+  {
+    printf '%s\n' "CREATE TABLE IF NOT EXISTS recovery_balances("
+    printf '%s\n' "  address TEXT PRIMARY KEY, chain_id BIGINT NOT NULL, amount NUMERIC(78,0) NOT NULL,"
+    printf '%s\n' "  claim_status TEXT NOT NULL DEFAULT 'unclaimed', claimed_by TEXT, claimed_by_user_id TEXT,"
+    printf '%s\n' "  claim_tx_hash TEXT, claim_tx_chain_id BIGINT, claimed_at TIMESTAMPTZ,"
+    printf '%s\n' "  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());"
+    printf '%s\n' "CREATE INDEX IF NOT EXISTS recovery_balances_status_idx ON recovery_balances(claim_status);"
+    printf '%s\n' "CREATE TEMP TABLE recovery_seed(address TEXT, chain_id BIGINT, amount NUMERIC(78,0));"
+    printf '%s\n' "\\copy recovery_seed(address, chain_id, amount) FROM '$csv' WITH (FORMAT csv)"
+    printf '%s\n' "INSERT INTO recovery_balances(address, chain_id, amount) SELECT address, chain_id, amount FROM recovery_seed ON CONFLICT (address) DO NOTHING;"
+  } | psql "$BOT_DB_URL" -X -q -v ON_ERROR_STOP=1 >/dev/null
+
+  progress_info "Seeded recovery_balances into $MIGRATION_DB_BOT_SUFFIX from $EXTERNAL_HOLDERS_JSON."
+}
+
 merge_smart_wallet_batches() {
   node - "$SMART_WALLET_INPUT_JSON" "$SMART_WALLET_BATCH_DIR" "$DEPLOYED_SMART_WALLETS_JSON" <<'NODE'
 const fs = require("fs");
@@ -1294,6 +1350,10 @@ print_phase "Balance Artifacts"
 run_step "balance_artifacts_external_wipe" "Write app/external balances and wipe external Ponder balances" write_balance_artifacts_and_wipe_external
 progress_info "App distribution: $APP_DISTRIBUTION_JSON"
 progress_info "External holders: $EXTERNAL_HOLDERS_JSON"
+
+print_phase "Recovery Balances"
+run_step "seed_recovery_balances" "Seed recovery balances for non-migrated holders" seed_recovery_balances
+progress_info "Non-app holders are claimable post-migration via the recovery flow; faucet/auto-migrated addresses are excluded by the external-holder query."
 
 print_phase "Celo Smart Wallet Deployment"
 SMART_WALLET_COUNT="$(json_array_length "$SMART_WALLET_INPUT_JSON" owners)"

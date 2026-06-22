@@ -1,0 +1,5 @@
+backend/migration-artifacts/
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+*.log
