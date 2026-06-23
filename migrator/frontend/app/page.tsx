@@ -144,7 +144,9 @@ function RailItem(props: {
 
 function ConfigPanel({ config, onSave }: { config: ConfigResponse | null; onSave: (key: string, value: string) => Promise<void> }) {
   if (!config) return <p className="desc">Loading configuration…</p>
-  const groups = groupFields(config.fields)
+  // The broadcast/dry-run setting is shown as a dedicated toggle, not a text field.
+  const groups = groupFields(config.fields.filter((f) => f.key !== "MIGRATION_BROADCAST"))
+  const dryRun = !config.broadcast
   return (
     <>
       <h2>Configuration</h2>
@@ -152,6 +154,9 @@ function ConfigPanel({ config, onSave }: { config: ConfigResponse | null; onSave
         All settings load from the environment. Override or fill any below. Secrets are write-only — they show as set,
         never echoed. The migration cannot start until every required value is set.
       </p>
+
+      <DryRunToggle dryRun={dryRun} onChange={(on) => onSave("MIGRATION_BROADCAST", on ? "false" : "true")} />
+
       {config.missing.length > 0 ? (
         <div className="banner warn">{config.missing.length} required setting(s) missing: {config.missing.join(", ")}</div>
       ) : (
@@ -166,6 +171,41 @@ function ConfigPanel({ config, onSave }: { config: ConfigResponse | null; onSave
         </div>
       ))}
     </>
+  )
+}
+
+function DryRunToggle({ dryRun, onChange }: { dryRun: boolean; onChange: (on: boolean) => Promise<void> }) {
+  const [busy, setBusy] = useState(false)
+  const toggle = async () => {
+    setBusy(true)
+    try {
+      await onChange(!dryRun)
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <div className={`dryrun ${dryRun ? "on" : "live"}`}>
+      <div>
+        <div className="dryrun-title">{dryRun ? "Dry run" : "LIVE — broadcasting"}</div>
+        <div className="dryrun-sub">
+          {dryRun
+            ? "Read-only: forge runs without --broadcast and DB-mutating steps are skipped. Preflight and artifact steps still run."
+            : "Transactions are broadcast on-chain and database mutations are applied. This is a real migration run."}
+        </div>
+      </div>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={dryRun}
+        aria-label="Dry run"
+        className={`switch ${dryRun ? "on" : ""}`}
+        disabled={busy}
+        onClick={() => void toggle()}
+      >
+        <span className="knob" />
+      </button>
+    </div>
   )
 }
 
