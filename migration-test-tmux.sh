@@ -50,6 +50,14 @@ usage() {
   cat <<USAGE
 Usage: $(basename "$0") [options]
 
+TEST HARNESS ONLY. This script clones production state into local databases and
+stands up local anvil forks of Berachain and Celo so the migration can be
+rehearsed end-to-end against a disposable copy. It is NOT part of the real
+production migration: the live run uses the migrator web app (see
+migrator/README.md) against real chains and the real databases, and this script
+is never executed during it. (Among other things, it deals fake backing and
+storage-pranks AccessControl roles to the anvil key — strictly local-test setup.)
+
 Starts a tmux session with five panes:
   1. Berachain anvil fork
   2. Celo anvil fork

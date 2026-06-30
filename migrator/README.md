@@ -164,3 +164,17 @@ of a run's state lives under its artifact directory `MIGRATION_ARTIFACT_ROOT/<id
   value you didn't override in the UI.
 
 The current id shows in the top bar and `GET /api/config` (`run_id`).
+
+## Local testing vs. production
+
+To rehearse the whole migration safely, use the **local test harness**
+`migration-test-tmux.sh` (repo root). It clones the production databases into
+local copies and stands up anvil forks of Berachain and Celo, then you point the
+migrator at those local forks/DBs and step through it exactly as you would in
+production. The harness also deals fake backing and storage-pranks the migration
+AccessControl roles to the anvil key so the run can proceed without real admin
+keys.
+
+**The harness is test-only and is never used in the real production run.** The
+live migration runs this migrator against the real chains and real databases;
+nothing in `migration-test-tmux.sh` executes during it.

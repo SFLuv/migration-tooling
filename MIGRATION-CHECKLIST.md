@@ -133,9 +133,16 @@ and never records step completion. Safe to run against production DBs.
   - [ ] `migrator.log` — the per-run log, for any warnings.
 - [ ] Final go/no-go checklist in [open-questions.md](celo-migration-skill/references/open-questions.md) reviewed.
 
-> Optional but recommended: full end-to-end rehearsal in the tmux harness
-> (`migration-test-tmux.sh`) including booting the Celo Ponder on a fresh DB and
-> running the backfill, before touching production.
+> Optional but recommended: full end-to-end rehearsal in the **local test
+> harness** (`migration-test-tmux.sh`) including booting the Celo Ponder on a
+> fresh DB and running the backfill, before touching production.
+>
+> **The tmux harness is for local testing only — it is never used in the real
+> production run.** It clones production databases into local copies and stands up
+> anvil forks of Berachain and Celo (and, for testing, deals fake backing and
+> storage-pranks the migration roles to the anvil key). The live migration runs
+> the migrator against the real chains and real databases; the harness plays no
+> part in it.
 
 ---
 
