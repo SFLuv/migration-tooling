@@ -24,7 +24,7 @@ PONDER_PORT="${PONDER_PORT:-42069}"
 PONDER_HOST="${PONDER_HOST:-localhost}"
 PONDER_COMMAND="${PONDER_COMMAND:-start}"
 PONDER_START_BLOCK="${PONDER_START_BLOCK:-}"
-PONDER_WAIT_SECONDS="${PONDER_WAIT_SECONDS:-120}"
+PONDER_WAIT_SECONDS="${PONDER_WAIT_SECONDS:-600}"
 BOOT_WAIT_SECONDS="${BOOT_WAIT_SECONDS:-180}"
 BACKEND_ENV="${BACKEND_ENV:-$BACKEND_DIR/.env}"
 FRONTEND_SCRIPT="${FRONTEND_SCRIPT:-dev-http}"
@@ -80,7 +80,7 @@ Options:
   --ponder-command COMMAND       Ponder CLI command. Default: start.
                                   Use dev for hot-reload local development.
   --ponder-start-block BLOCK     Optional Ponder start block. Default: Ponder config default.
-  --ponder-wait-seconds SECONDS  Seconds backend waits for Ponder port. Default: 120.
+  --ponder-wait-seconds SECONDS  Seconds backend waits for Ponder port. Default: 600.
   --boot-wait-seconds SECONDS    Seconds to wait for each service port after tmux startup.
                                   Default: 180.
   --root-env PATH                Root env file with PRODUCTION_POSTGRES_CONNECTION_STRING and
@@ -1108,10 +1108,13 @@ for ((i = 1; i <= $(shell_quote "$PONDER_WAIT_SECONDS"); i++)); do
     ponder_ready=true
     break
   fi
+  if (( i % 15 == 0 )); then
+    printf '%s\n' \"Still waiting for Ponder (\${i}s/${PONDER_WAIT_SECONDS}s) — it may be running historical sync; check the Ponder pane.\"
+  fi
   sleep 1
 done
 if [[ \$ponder_ready != true ]]; then
-  printf '%s\n' $(shell_quote "Ponder did not become reachable at $PONDER_URL within $PONDER_WAIT_SECONDS seconds.") >&2
+  printf '%s\n' $(shell_quote "Ponder did not become reachable at $PONDER_URL within $PONDER_WAIT_SECONDS seconds. If it is still doing historical sync, re-run with a larger --ponder-wait-seconds.") >&2
   exit 1
 fi
 ENV_FILE=$(shell_quote "$BACKEND_ENV") \
