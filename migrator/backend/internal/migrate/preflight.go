@@ -243,6 +243,37 @@ func checkBacking(ctx context.Context, s *Session, newRPC, newToken, distributor
 	run.setData("remaining_to_back", remaining.String())
 	add("Already distributed", true, false, "new token totalSupply "+supply.String())
 
+	// Berachain total-supply bound (decimal-adjusted): the distributor must be
+	// able to back the FULL old-chain SFLUV supply converted to new-token units,
+	// not just the funded subset. The 18->6 decimal difference is applied by
+	// dividing by MIGRATION_DECIMAL_SCALE (10^(old-new), verified above).
+	oldRPC := s.cfg.Get("OLD_CHAIN_RPC")
+	oldToken := s.cfg.Get("OLD_TOKEN")
+	scaleBig, ok := parseBig(s.cfg.Get("MIGRATION_DECIMAL_SCALE"))
+	if !ok || scaleBig.Sign() <= 0 {
+		return fmt.Errorf("invalid MIGRATION_DECIMAL_SCALE")
+	}
+	beraSupplyStr, err := castCall(ctx, oldRPC, oldToken, "totalSupply()(uint256)")
+	if err != nil {
+		return err
+	}
+	beraSupply, ok := parseBig(beraSupplyStr)
+	if !ok {
+		return fmt.Errorf("unexpected Berachain totalSupply %q", beraSupplyStr)
+	}
+	beraSupplyNewUnits := new(big.Int).Div(beraSupply, scaleBig)
+	run.setData("bera_total_supply", beraSupply.String())
+	run.setData("bera_total_supply_new_units", beraSupplyNewUnits.String())
+	add("Berachain SFLUV total supply", true, false,
+		fmt.Sprintf("%s old-decimal units = %s new-token units after dividing by %s", beraSupply.String(), beraSupplyNewUnits.String(), scaleBig.String()))
+
+	// Required backing is the strict bound: max of the projected funded
+	// distribution and the full Berachain supply (both in new-token units),
+	// less what the new token already has minted.
+	remainingVsBera := bigSubFloorZero(beraSupplyNewUnits, supply)
+	required := bigMax(remaining, remainingVsBera)
+	run.setData("required_backing", required.String())
+
 	balStr, err := castCall(ctx, newRPC, underlying, "balanceOf(address)(uint256)", distributorAddr)
 	if err != nil {
 		return err
@@ -251,10 +282,12 @@ func checkBacking(ctx context.Context, s *Session, newRPC, newToken, distributor
 	if bal == nil {
 		bal = big.NewInt(0)
 	}
-	if !bigGTE(bal, remaining) {
-		add("Backing balance", false, true, fmt.Sprintf("distributor backing %s < remaining %s", bal.String(), remaining.String()))
+	if !bigGTE(bal, required) {
+		add("Backing balance covers Berachain supply", false, true,
+			fmt.Sprintf("distributor backing %s < required %s (Berachain-supply bound %s, projected %s)", bal.String(), required.String(), remainingVsBera.String(), remaining.String()))
 	} else {
-		add("Backing balance", true, true, "covers remaining "+remaining.String())
+		add("Backing balance covers Berachain supply", true, true,
+			fmt.Sprintf("%s covers required %s (Berachain-supply bound, decimal-adjusted)", bal.String(), required.String()))
 	}
 
 	allowStr, err := castCall(ctx, newRPC, underlying, "allowance(address,address)(uint256)", distributorAddr, newToken)
@@ -265,10 +298,12 @@ func checkBacking(ctx context.Context, s *Session, newRPC, newToken, distributor
 	if allow == nil {
 		allow = big.NewInt(0)
 	}
-	if !bigGTE(allow, remaining) {
-		add("Backing allowance", false, true, fmt.Sprintf("distributor allowance %s < remaining %s", allow.String(), remaining.String()))
+	if !bigGTE(allow, required) {
+		add("Backing allowance covers Berachain supply", false, true,
+			fmt.Sprintf("distributor allowance %s < required %s", allow.String(), required.String()))
 	} else {
-		add("Backing allowance", true, true, "covers remaining "+remaining.String())
+		add("Backing allowance covers Berachain supply", true, true,
+			fmt.Sprintf("%s covers required %s", allow.String(), required.String()))
 	}
 	return nil
 }

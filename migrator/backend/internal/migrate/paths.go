@@ -9,9 +9,16 @@ import (
 	"github.com/SFLuv/migrator/backend/internal/runner"
 )
 
-// artifactDir is the per-run artifact directory (artifact root + run id).
+// artifactDir is the per-run artifact directory (artifact root + run id),
+// resolved to an absolute path so artifact paths handed to forge — which runs
+// with its working directory set to the contracts repo — resolve correctly
+// regardless of the caller's working directory.
 func (s *Session) artifactDir() string {
-	return filepath.Join(s.cfg.Get("MIGRATION_ARTIFACT_ROOT"), s.runID)
+	dir := filepath.Join(s.cfg.Get("MIGRATION_ARTIFACT_ROOT"), s.runID)
+	if abs, err := filepath.Abs(dir); err == nil {
+		return abs
+	}
+	return dir
 }
 
 func (s *Session) ensureArtifactDir() (string, error) {

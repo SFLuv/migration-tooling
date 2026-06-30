@@ -43,6 +43,7 @@ func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 		"fields":    cfg.Views(),
 		"missing":   cfg.MissingRequired(),
 		"broadcast": cfg.Broadcast(),
+		"run_id":    s.session.RunID(),
 	})
 }
 
@@ -55,7 +56,7 @@ func (s *Server) putConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
-	if err := s.session.Config().Set(body.Key, body.Value); err != nil {
+	if err := s.session.SetConfig(body.Key, body.Value); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}

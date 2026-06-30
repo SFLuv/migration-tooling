@@ -7,12 +7,14 @@ export interface FieldView {
   purpose: string
   is_set: boolean
   value: string
+  redacted?: boolean
 }
 
 export interface ConfigResponse {
   fields: FieldView[]
   missing: string[]
   broadcast: boolean
+  run_id?: string
 }
 
 export type StepState = "pending" | "running" | "success" | "failed"
@@ -26,6 +28,14 @@ export interface StepSummary {
   runnable: boolean
   reason?: string
   error?: string
+  warning?: string
+  snippets?: Snippet[]
+}
+
+export interface Snippet {
+  title: string
+  language?: string
+  content: string
 }
 
 export interface LogLine {

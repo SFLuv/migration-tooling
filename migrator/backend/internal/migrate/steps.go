@@ -46,17 +46,10 @@ func buildSteps() []*Step {
 			Run:         runNormalizeApp,
 		},
 		{
-			ID:          "normalize-ponder",
-			Name:        "Normalize Ponder values",
-			Description: "Divide Ponder transfer/allowance amounts to 6-decimal units, recompute transfer_account balances (clamped ≥0), and clear reorg logs. Skipped on dry run.",
-			ConfigKeys:  []string{"MIGRATION_DB_CONNECTION_STRING", "MIGRATION_DB_PONDER_SUFFIX", "MIGRATION_DECIMAL_SCALE", "MIGRATION_BROADCAST", "MIGRATION_ARTIFACT_ROOT"},
-			Run:         runNormalizePonder,
-		},
-		{
 			ID:          "artifacts",
-			Name:        "Balance artifacts & external wipe",
-			Description: "Write app distribution and external-holder balance artifacts from transfer events; on a real run, delete non-app transfer_account rows (atomic with the wipe marker).",
-			ConfigKeys:  []string{"MIGRATION_DB_CONNECTION_STRING", "MIGRATION_DB_PONDER_SUFFIX", "MIGRATION_EXTRA_FUNDED_ADDRESSES", "MIGRATION_DECIMAL_SCALE", "MIGRATION_ARTIFACT_ROOT", "MIGRATION_BROADCAST"},
+			Name:        "Balance artifacts",
+			Description: "Read-only: derive app distribution and external-holder balance artifacts from the legacy Ponder transfer events, normalizing 18→6 decimals on the fly. The legacy Ponder DB is never mutated.",
+			ConfigKeys:  []string{"MIGRATION_DB_CONNECTION_STRING", "MIGRATION_DB_APP_SUFFIX", "MIGRATION_DB_PONDER_SUFFIX", "MIGRATION_EXTRA_FUNDED_ADDRESSES", "MIGRATION_DECIMAL_SCALE", "MIGRATION_ARTIFACT_ROOT"},
 			Run:         runBalanceArtifacts,
 		},
 		{
@@ -74,6 +67,13 @@ func buildSteps() []*Step {
 			Run:         runDeploySmartWallets,
 		},
 		{
+			ID:          "wrap-unwrap",
+			Name:        "Backing recovery check",
+			Description: "Before minting all balances, wrap a tiny amount of backing into Celo SFLUV and immediately unwrap it, proving the backing can be locked AND recovered (we never lock up backing we can't get back). Aborts the migration if the roundtrip fails. Runs as a simulation on a dry run.",
+			ConfigKeys:  []string{"NEW_CHAIN_RPC", "NEW_TOKEN", "DISTRIBUTOR_PRIVATE_KEY", "REDEEMER_PRIVATE_KEY", "WRAP_CHECK_AMOUNT", "NEW_CHAIN_ID", "CONTRACTS_DIR", "MIGRATION_BROADCAST"},
+			Run:         runWrapUnwrapCheck,
+		},
+		{
 			ID:          "distribute",
 			Name:        "Distribute Celo balances",
 			Description: "Mint/deposit each holder's exact balance on Celo SFLUV via depositFor (idempotent: only the remaining delta per address is sent).",
@@ -81,11 +81,27 @@ func buildSteps() []*Step {
 			Run:         runDistribute,
 		},
 		{
+			ID:          "replicate-roles",
+			Name:        "Replicate MINTER/REDEEMER roles",
+			Description: "Scan all Berachain SFLUV holders (plus the funded service accounts), find which hold MINTER_ROLE / REDEEMER_ROLE on the old token, and grant the same roles on Celo SFLUV. Idempotent. Skipped on dry run.",
+			ConfigKeys:  []string{"OLD_CHAIN_RPC", "OLD_TOKEN", "NEW_CHAIN_RPC", "NEW_TOKEN", "CELO_ADMIN_PRIVATE_KEY", "MIGRATION_DB_CONNECTION_STRING", "MIGRATION_DB_PONDER_SUFFIX", "MIGRATION_EXTRA_FUNDED_ADDRESSES", "BERA_CHAIN_ID", "NEW_CHAIN_ID", "CONTRACTS_DIR", "MIGRATION_ARTIFACT_ROOT", "MIGRATION_BROADCAST"},
+			Run:         runReplicateRoles,
+		},
+		{
 			ID:          "completion",
 			Name:        "Completion",
 			Description: "Resolve the Celo completion block (max of chain head and broadcast receipts) and write the migration result with the Ponder start block.",
 			ConfigKeys:  []string{"NEW_CHAIN_RPC", "OLD_TOKEN", "NEW_TOKEN", "MIGRATION_ARTIFACT_ROOT"},
 			Run:         runCompletion,
+		},
+		{
+			ID:          "backfill",
+			Name:        "Backfill Celo Ponder history",
+			Description: "Pull the Berachain Ponder history into the dedicated Celo Ponder database, normalizing 18→6 decimals during the copy. transfer_event/allowance/approval_event are copied with normalized amounts; transfer_account is rebuilt from the app distribution artifact (app + funded only, external holders excluded); the custom ponder_hooks webhook registrations are migrated too (the event handlers run from the new instance's own code). The legacy Ponder DB is read-only. Idempotent; verifies counts and totals. Skipped on dry run.",
+			ConfigKeys:  []string{"MIGRATION_DB_CONNECTION_STRING", "MIGRATION_DB_PONDER_SUFFIX", "MIGRATION_DB_CELO_PONDER_SUFFIX", "CELO_PONDER_SCHEMA", "BERA_CHAIN_ID", "NEW_CHAIN_ID", "NEW_TOKEN", "NEW_CHAIN_RPC", "MIGRATION_ARTIFACT_ROOT", "MIGRATION_BROADCAST"},
+			Warn:        backfillWarning,
+			Snippets:    backfillSnippets,
+			Run:         runBackfill,
 		},
 	}
 }

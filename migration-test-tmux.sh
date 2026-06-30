@@ -6,6 +6,7 @@ APP_DIR="$ROOT_DIR/repos/app"
 BACKEND_DIR="$APP_DIR/backend"
 FRONTEND_DIR="$APP_DIR/frontend"
 PONDER_DIR="$APP_DIR/ponder"
+CONTRACTS_DIR="$ROOT_DIR/repos/contracts"
 
 SESSION_NAME="${SESSION_NAME:-sfluv-migration-test}"
 ROOT_ENV="${ROOT_ENV:-$ROOT_DIR/.env}"
@@ -55,6 +56,13 @@ Starts a tmux session with five panes:
   3. Ponder pointed at the local Berachain fork
   4. Backend using a generated local Berachain config
   5. Frontend
+
+After the anvil forks boot, the migration AccessControl roles on OLD_TOKEN
+(Berachain) and NEW_TOKEN (Celo) are granted to the default anvil account so the
+migration can run with the anvil key instead of real admin keys. Set TEST_ADMIN
+to empower a different address; the step is skipped if OLD_TOKEN/NEW_TOKEN are
+unset. The test chains are OLD_CHAIN_RPC / NEW_CHAIN_RPC (default: the local
+forks this script starts).
 
 Options:
   --bera-rpc URL                 Berachain RPC URL to fork. Default: $DEFAULT_BERA_RPC.
@@ -252,6 +260,8 @@ esac
 
 require_cmd tmux
 require_cmd anvil
+require_cmd forge
+require_cmd cast
 require_cmd nc
 require_cmd node
 require_cmd go
@@ -260,6 +270,7 @@ require_cmd psql
 require_cmd pg_dump
 
 BERA_LOCAL_RPC="http://127.0.0.1:$BERA_PORT"
+CELO_LOCAL_RPC="http://127.0.0.1:$CELO_PORT"
 BERA_LOCAL_WS="ws://127.0.0.1:$BERA_PORT"
 BACKEND_URL="http://127.0.0.1:$BACKEND_PORT"
 FRONTEND_URL="http://127.0.0.1:$FRONTEND_PORT"
@@ -931,6 +942,27 @@ PAID_ADMIN_ADDRESSES_VALUE="$(env_or_file_value PAID_ADMIN_ADDRESSES)"
 W9_TRANSACTION_URL="$BACKEND_URL/w9/transaction"
 PONDER_CALLBACK_URL="$BACKEND_URL/ponder/callback"
 
+# Migration test-role setup: empower the default anvil account on both local
+# forks so the migration can run with the anvil key instead of real admin keys.
+# Tokens come from the migration env; the test chains are the local anvil forks
+# (OLD_CHAIN_RPC / NEW_CHAIN_RPC, defaulting to the forks this script started).
+MIGRATION_OLD_TOKEN="$(env_or_file_value_from OLD_TOKEN "$ROOT_ENV")"
+MIGRATION_NEW_TOKEN="$(env_or_file_value_from NEW_TOKEN "$ROOT_ENV")"
+MIGRATION_OLD_RPC="$(env_or_file_value_from OLD_CHAIN_RPC "$ROOT_ENV" "$BERA_LOCAL_RPC")"
+MIGRATION_NEW_RPC="$(env_or_file_value_from NEW_CHAIN_RPC "$ROOT_ENV" "$CELO_LOCAL_RPC")"
+# Test admin (receives the roles) and the key that signs the grant transactions.
+# Both default to anvil account #0, whose key is a well-known public test key.
+TEST_CHAIN_ADMIN="$(env_or_file_value_from TEST_ADMIN "$ROOT_ENV" "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266")"
+TEST_CHAIN_ADMIN_KEY="$(env_or_file_value_from TEST_ADMIN_KEY "$ROOT_ENV" "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80")"
+# OpenZeppelin v5 AccessControl (ERC-7201) storage location; used to seed
+# DEFAULT_ADMIN_ROLE for the test admin by writing the fork's hasRole slot.
+ACL_STORAGE_LOCATION="0x02dd7bc7dec4dceedda775e58dd541e08a116c6c53815c0bd028192f7b626800"
+ACL_DEFAULT_ADMIN_ROLE="0x0000000000000000000000000000000000000000000000000000000000000000"
+ACL_TRUE_WORD="0x0000000000000000000000000000000000000000000000000000000000000001"
+# Backing-token balance to deal to the test admin on each side (~3.4e38 base
+# units; comfortably covers any distribution). Written to the ERC20 balance slot.
+BACKING_MINT_WORD="0x00000000000000000000000000000000ffffffffffffffffffffffffffffffff"
+
 trap handle_signal INT TERM
 trap handle_exit EXIT
 
@@ -1109,6 +1141,131 @@ NEXT_PUBLIC_BACKEND_BASE_URL=$(shell_quote "$BACKEND_URL") \
 NEXT_PUBLIC_APP_BASE_URL=$(shell_quote "$FRONTEND_URL") \
 pnpm run $(shell_quote "$FRONTEND_SCRIPT") -H 0.0.0.0 -p $(shell_quote "$FRONTEND_PORT")"
 
+# Give an account a large ERC20 balance on the fork by finding and writing its
+# balanceOf storage slot (the StdStorage probe: write a sentinel to each
+# candidate mapping slot until balanceOf reflects it). Works for standard
+# mapping(address=>uint) layouts (e.g. USDC, OZ ERC20); returns 1 if not found.
+deal_erc20_balance() {
+  local rpc="$1"
+  local token="$2"
+  local account="$3"
+  local amount_word="$4"
+  local sentinel="0x0000000000000000000000000000000000000000000000000000000000000539" # 1337
+  local i slot orig newbal
+  for i in $(seq 0 40); do
+    slot="$(cast keccak "$(cast abi-encode 'f(address,uint256)' "$account" "$i")")"
+    orig="$(cast storage "$token" "$slot" --rpc-url "$rpc" 2>/dev/null)" || return 1
+    cast rpc --rpc-url "$rpc" anvil_setStorageAt "$token" "$slot" "$sentinel" >/dev/null 2>&1 || return 1
+    newbal="$(cast call "$token" 'balanceOf(address)(uint256)' "$account" --rpc-url "$rpc" 2>/dev/null | awk '{print $1}')"
+    if [[ "$newbal" == "1337" ]]; then
+      cast rpc --rpc-url "$rpc" anvil_setStorageAt "$token" "$slot" "$amount_word" >/dev/null 2>&1 || return 1
+      return 0
+    fi
+    cast rpc --rpc-url "$rpc" anvil_setStorageAt "$token" "$slot" "$orig" >/dev/null 2>&1 || true
+  done
+  return 1
+}
+
+# Mint backing for the test admin on a chain: resolve the proxy's underlying()
+# and deal it a large balance. The setup script already set the proxy allowance.
+fund_backing_on_chain() {
+  local label="$1"
+  local rpc="$2"
+  local token="$3"
+  local backing
+
+  progress_step "Fund backing token: $label"
+  backing="$(cast call "$token" 'underlying()(address)' --rpc-url "$rpc" 2>/dev/null | awk '{print $1}')"
+  if [[ ! "$backing" =~ ^0x[0-9a-fA-F]{40}$ ]] || [[ "$backing" == "0x0000000000000000000000000000000000000000" ]]; then
+    progress_skip
+    progress_info "Could not resolve underlying() on $token; skipping backing funding."
+    return 0
+  fi
+  if deal_erc20_balance "$rpc" "$backing" "$TEST_CHAIN_ADMIN" "$BACKING_MINT_WORD"; then
+    progress_ok
+    progress_info "Minted backing $backing to $TEST_CHAIN_ADMIN (proxy allowance set by setup script)."
+  else
+    progress_skip
+    progress_info "Could not locate balance slot for backing $backing; mint it manually if distribution needs it."
+  fi
+}
+
+# Storage slot of AccessControlStorage._roles[role].hasRole[account] for the
+# OpenZeppelin v5 (ERC-7201) layout, computed with cast.
+acl_has_role_slot() {
+  local role="$1"
+  local account="$2"
+  local role_slot
+  role_slot="$(cast keccak "$(cast abi-encode 'f(bytes32,bytes32)' "$role" "$ACL_STORAGE_LOCATION")")"
+  cast keccak "$(cast abi-encode 'f(address,bytes32)' "$account" "$role_slot")"
+}
+
+grant_roles_on_chain() {
+  local label="$1"
+  local rpc="$2"
+  local token="$3"
+  local log_file admin_slot
+
+  progress_step "Grant migration roles: $label"
+  log_file="$(mktemp "${TMPDIR:-/tmp}/sfluv-role-setup.XXXXXX")"
+  admin_slot="$(acl_has_role_slot "$ACL_DEFAULT_ADMIN_ROLE" "$TEST_CHAIN_ADMIN")"
+
+  # 1. Seed DEFAULT_ADMIN_ROLE for the test admin by writing the fork's hasRole
+  #    slot directly (no key/owner needed). 2. As that account, grant the
+  #    remaining migration roles with real transactions.
+  if ( set -e
+        cast rpc --rpc-url "$rpc" anvil_setStorageAt "$token" "$admin_slot" "$ACL_TRUE_WORD" >/dev/null
+        cd "$CONTRACTS_DIR"
+        SFLUV_PROXY="$token" TEST_ADMIN="$TEST_CHAIN_ADMIN" \
+          forge script script/SetupMigrationTestEnv.s.sol:SetupMigrationTestEnv \
+            --rpc-url "$rpc" --broadcast --private-key "$TEST_CHAIN_ADMIN_KEY" ) \
+        >"$log_file" 2>&1; then
+    progress_ok
+    progress_info "Granted DEFAULT_ADMIN/MINTER/REDEEMER/MIGRATOR to $TEST_CHAIN_ADMIN on $token"
+    rm -f "$log_file"
+    return 0
+  fi
+  progress_fail
+  sed 's/^/    /' "$log_file" >&2 || true
+  rm -f "$log_file"
+  die "failed to grant migration roles on $label"
+}
+
+# Empower the default anvil account on both local forks so the migration can be
+# exercised with the well-known anvil key instead of real admin keys. Skipped
+# when the migration token addresses are not configured.
+grant_migration_test_roles() {
+  if [[ ! -d "$CONTRACTS_DIR" ]]; then
+    progress_step "Grant migration roles"
+    progress_skip
+    progress_info "Contracts repo not found at $CONTRACTS_DIR; skipping migration role setup."
+    return 0
+  fi
+  if [[ -z "$MIGRATION_OLD_TOKEN" && -z "$MIGRATION_NEW_TOKEN" ]]; then
+    progress_step "Grant migration roles"
+    progress_skip
+    progress_info "OLD_TOKEN/NEW_TOKEN not set in $ROOT_ENV; skipping migration role setup."
+    return 0
+  fi
+
+  if [[ -n "$MIGRATION_OLD_TOKEN" ]]; then
+    grant_roles_on_chain "Berachain" "$MIGRATION_OLD_RPC" "$MIGRATION_OLD_TOKEN"
+    fund_backing_on_chain "Berachain" "$MIGRATION_OLD_RPC" "$MIGRATION_OLD_TOKEN"
+  else
+    progress_step "Grant migration roles: Berachain"
+    progress_skip
+    progress_info "OLD_TOKEN not set; skipping Berachain role setup."
+  fi
+  if [[ -n "$MIGRATION_NEW_TOKEN" ]]; then
+    grant_roles_on_chain "Celo" "$MIGRATION_NEW_RPC" "$MIGRATION_NEW_TOKEN"
+    fund_backing_on_chain "Celo" "$MIGRATION_NEW_RPC" "$MIGRATION_NEW_TOKEN"
+  else
+    progress_step "Grant migration roles: Celo"
+    progress_skip
+    progress_info "NEW_TOKEN not set; skipping Celo role setup."
+  fi
+}
+
 print_phase "Chain Startup"
 check_required_ports_available "Final server port check" || die "server ports are unavailable"
 progress_step "Start Berachain anvil pane"
@@ -1125,6 +1282,9 @@ progress_ok
 print_phase "Chain Boot Verification"
 wait_for_service_port "Berachain anvil" "127.0.0.1" "$BERA_PORT" "$BERA_PANE" "$BOOT_WAIT_SECONDS" || die "Berachain anvil failed to boot"
 wait_for_service_port "Celo anvil" "127.0.0.1" "$CELO_PORT" "$CELO_PANE" "$BOOT_WAIT_SECONDS" || die "Celo anvil failed to boot"
+
+print_phase "Migration Test Roles"
+grant_migration_test_roles
 
 print_phase "Ponder Startup"
 progress_step "Start Ponder pane"

@@ -133,91 +133,15 @@ func runNormalizeApp(ctx context.Context, s *Session, run *StepRun) error {
 	return nil
 }
 
-// runNormalizePonder divides Ponder amounts to 6-decimal units and recomputes
-// transfer_account balances (clamped ≥0), clearing reorg logs.
-func runNormalizePonder(ctx context.Context, s *Session, run *StepRun) error {
-	dir, err := s.ensureArtifactDir()
-	if err != nil {
-		return err
-	}
-	pool, err := s.ponderPool(ctx)
-	if err != nil {
-		return err
-	}
-	scale := s.cfg.Get("MIGRATION_DECIMAL_SCALE")
-
-	if done, err := hasDecimalMarker(ctx, pool, "ponder_18_to_6"); err != nil {
-		return err
-	} else if done {
-		run.log("ponder normalization marker already present; leaving values unchanged")
-		return nil
-	}
-
-	var eventRows int64
-	var eventTotalBefore, accountPositiveBefore string
-	_ = pool.QueryRow(ctx, `SELECT COUNT(*), COALESCE(SUM(amount),0)::text FROM transfer_event`).Scan(&eventRows, &eventTotalBefore)
-	_ = pool.QueryRow(ctx, `SELECT COALESCE(SUM(balance) FILTER (WHERE balance>0),0)::text FROM transfer_account`).Scan(&accountPositiveBefore)
-	run.setData("transfer_event_rows", eventRows)
-	run.setData("transfer_event_total_before", eventTotalBefore)
-	run.setData("transfer_account_positive_before", accountPositiveBefore)
-	_ = writeJSONFile(filepath.Join(dir, "ponder-normalization-before.json"), map[string]any{
-		"scale": scale, "transfer_event_rows": eventRows, "transfer_event_total_before": eventTotalBefore,
-		"transfer_account_positive_before": accountPositiveBefore,
-	})
-
-	if !s.cfg.Broadcast() {
-		run.log("dry run: ponder values left unchanged (events=%d, positive balance total=%s)", eventRows, accountPositiveBefore)
-		return nil
-	}
-
-	reorg, err := reorgCleanupSQL(ctx, pool)
-	if err != nil {
-		return err
-	}
-	if _, err := pool.Exec(ctx, decimalMarkerTableSQL); err != nil {
-		return err
-	}
-	body := fmt.Sprintf(`
-		UPDATE transfer_event SET amount = FLOOR(amount / %[1]s);
-		UPDATE allowance SET amount = FLOOR(amount / %[1]s);
-		UPDATE approval_event SET amount = FLOOR(amount / %[1]s);
-		CREATE TEMP TABLE recomputed_transfer_account AS
-		SELECT chain_id, address, SUM(delta) AS balance, FALSE AS is_owner
-		FROM (
-			SELECT chain_id, LOWER("from") AS address, -amount AS delta FROM transfer_event
-			UNION ALL
-			SELECT chain_id, LOWER("to") AS address, amount AS delta FROM transfer_event
-		) movements
-		GROUP BY chain_id, address;
-		TRUNCATE transfer_account;
-		INSERT INTO transfer_account (chain_id, address, balance, is_owner)
-		SELECT chain_id, address, GREATEST(balance, 0), is_owner FROM recomputed_transfer_account;
-		INSERT INTO migration_decimal_normalization (id, scale) VALUES ('ponder_18_to_6', %[1]s);
-		%[2]s
-	`, scale, reorg)
-	if err := execTx(ctx, pool, body); err != nil {
-		return fmt.Errorf("ponder normalization: %w", err)
-	}
-
-	var eventTotalAfter, accountPositiveAfter string
-	_ = pool.QueryRow(ctx, `SELECT COALESCE(SUM(amount),0)::text FROM transfer_event`).Scan(&eventTotalAfter)
-	_ = pool.QueryRow(ctx, `SELECT COALESCE(SUM(balance) FILTER (WHERE balance>0),0)::text FROM transfer_account`).Scan(&accountPositiveAfter)
-	run.setData("transfer_event_total_after", eventTotalAfter)
-	run.setData("transfer_account_positive_after", accountPositiveAfter)
-	_ = writeJSONFile(filepath.Join(dir, "ponder-normalization-after.json"), map[string]any{
-		"transfer_event_total_after": eventTotalAfter, "transfer_account_positive_after": accountPositiveAfter,
-	})
-	run.log("normalized ponder: event total %s → %s; positive balances %s → %s", eventTotalBefore, eventTotalAfter, accountPositiveBefore, accountPositiveAfter)
-	return nil
-}
-
 type holderRow struct {
 	Address string `json:"address"`
 	Balance string `json:"balance"`
 }
 
-// runBalanceArtifacts writes the app/external balance artifacts and, on a real
-// run, wipes the external transfer_account rows (atomic with the wipe marker).
+// runBalanceArtifacts derives the app-distribution and external-holder balance
+// artifacts from the legacy Ponder transfer events (normalizing 18→6 on the fly).
+// Read-only: the legacy Ponder DB is never mutated — the normalized history is
+// pulled into the new Celo Ponder DB later by the backfill step.
 func runBalanceArtifacts(ctx context.Context, s *Session, run *StepRun) error {
 	dir, err := s.ensureArtifactDir()
 	if err != nil {
@@ -261,36 +185,7 @@ func runBalanceArtifacts(ctx context.Context, s *Session, run *StepRun) error {
 	}
 	run.setData("app_recipient_count", len(app))
 	run.setData("external_holder_count", len(external))
-	run.log("wrote %d app distribution rows and %d external holder rows", len(app), len(external))
-
-	if !s.cfg.Broadcast() {
-		run.log("dry run: external transfer_account rows left in place")
-		return nil
-	}
-
-	if _, err := ponderPool.Exec(ctx, externalWipeMarkerTableSQL); err != nil {
-		return err
-	}
-	var wiped int
-	_ = ponderPool.QueryRow(ctx, `SELECT COUNT(*) FROM migration_external_balance_wipe WHERE id='external_transfer_account_rows'`).Scan(&wiped)
-	if wiped > 0 {
-		run.log("external wipe already applied; keeping existing artifacts")
-		return nil
-	}
-
-	reorg, err := reorgCleanupSQL(ctx, ponderPool)
-	if err != nil {
-		return err
-	}
-	deleted, err := wipeExternalRows(ctx, ponderPool, funded, reorg)
-	if err != nil {
-		return fmt.Errorf("external wipe: %w", err)
-	}
-	run.setData("deleted_transfer_account_rows", deleted)
-	_ = writeJSONFile(filepath.Join(dir, "external-holder-balance-wipe-audit.json"), map[string]any{
-		"generated_at": time.Now().UTC().Format(time.RFC3339), "deleted_transfer_account_rows": deleted,
-	})
-	run.log("deleted %d non-app transfer_account rows (wipe marker recorded)", deleted)
+	run.log("wrote %d app distribution rows and %d external holder rows (legacy Ponder unchanged)", len(app), len(external))
 	return nil
 }
 
@@ -361,13 +256,6 @@ CREATE TABLE IF NOT EXISTS migration_decimal_normalization (
 	applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );`
 
-const externalWipeMarkerTableSQL = `
-CREATE TABLE IF NOT EXISTS migration_external_balance_wipe (
-	id TEXT PRIMARY KEY,
-	applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-	artifact_note TEXT NOT NULL DEFAULT ''
-);`
-
 const recoveryBalancesTableSQL = `
 CREATE TABLE IF NOT EXISTS recovery_balances(
 	address TEXT PRIMARY KEY,
@@ -399,20 +287,6 @@ func hasDecimalMarker(ctx context.Context, p *pgxpool.Pool, id string) (bool, er
 	return n > 0, nil
 }
 
-func reorgCleanupSQL(ctx context.Context, p *pgxpool.Pool) (string, error) {
-	var sb strings.Builder
-	for _, t := range []string{"transfer_event", "transfer_account", "allowance", "approval_event"} {
-		var exists bool
-		if err := p.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, "public._reorg__"+t).Scan(&exists); err != nil {
-			return "", err
-		}
-		if exists {
-			sb.WriteString("TRUNCATE _reorg__" + t + ";\n")
-		}
-	}
-	return sb.String(), nil
-}
-
 // execTx runs a multi-statement body in a single transaction.
 func execTx(ctx context.Context, p *pgxpool.Pool, body string) error {
 	tx, err := p.Begin(ctx)
@@ -431,22 +305,24 @@ func queryHolderRows(ctx context.Context, p *pgxpool.Pool, funded []string, amtE
 	if appSide {
 		predicate = "EXISTS"
 	}
+	// The legacy Ponder DB is single-chain (Berachain) and no longer carries a
+	// chain_id column, so balances are derived per address from the transfer_event
+	// deltas directly.
 	q := fmt.Sprintf(`
 		WITH funded AS (SELECT DISTINCT LOWER(a) AS address FROM unnest($1::text[]) a),
 		movements AS (
-			SELECT chain_id, LOWER("from") AS address, -(%[1]s) AS delta FROM transfer_event
+			SELECT LOWER("from") AS address, -(%[1]s) AS delta FROM transfer_event
 			UNION ALL
-			SELECT chain_id, LOWER("to") AS address, (%[1]s) AS delta FROM transfer_event
+			SELECT LOWER("to") AS address, (%[1]s) AS delta FROM transfer_event
 		),
-		chain_balances AS (
-			SELECT chain_id, address, GREATEST(SUM(delta), 0) AS balance FROM movements GROUP BY chain_id, address
+		balances AS (
+			SELECT address, GREATEST(SUM(delta), 0) AS balance FROM movements GROUP BY address
 		),
 		sel AS (
-			SELECT cb.address, SUM(cb.balance) AS balance
-			FROM chain_balances cb
-			WHERE %[2]s (SELECT 1 FROM funded f WHERE f.address = cb.address)
-			GROUP BY cb.address
-			HAVING SUM(cb.balance) > 0
+			SELECT b.address, b.balance
+			FROM balances b
+			WHERE %[2]s (SELECT 1 FROM funded f WHERE f.address = b.address)
+			AND b.balance > 0
 		)
 		SELECT address, balance::text FROM sel ORDER BY address;
 	`, amtExpr, predicate)
@@ -481,36 +357,4 @@ func writeHolderArtifact(path, note string, holders []holderRow) error {
 		"amounts":      amounts,
 		"holders":      holders,
 	})
-}
-
-func wipeExternalRows(ctx context.Context, p *pgxpool.Pool, funded []string, reorg string) (int64, error) {
-	tx, err := p.Begin(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback(ctx)
-
-	tag, err := tx.Exec(ctx, `
-		DELETE FROM transfer_account ta
-		WHERE NOT EXISTS (SELECT 1 FROM unnest($1::text[]) a WHERE LOWER(a) = LOWER(ta.address));
-	`, funded)
-	if err != nil {
-		return 0, err
-	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO migration_external_balance_wipe (id, artifact_note)
-		VALUES ('external_transfer_account_rows', 'External holder artifact written before deleting non-app transfer_account rows.')
-		ON CONFLICT (id) DO UPDATE SET applied_at = NOW(), artifact_note = EXCLUDED.artifact_note;
-	`); err != nil {
-		return 0, err
-	}
-	if reorg != "" {
-		if _, err := tx.Exec(ctx, reorg); err != nil {
-			return 0, err
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return 0, err
-	}
-	return tag.RowsAffected(), nil
 }

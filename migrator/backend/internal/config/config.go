@@ -39,25 +39,33 @@ var Fields = []Field{
 	{Key: "NEW_CHAIN_RPC", Label: "Celo RPC URL", Group: GroupChain, Required: true, Purpose: "Target chain JSON-RPC for smart-wallet deployment and distribution."},
 	{Key: "OLD_TOKEN", Label: "Berachain SFLUV proxy", Group: GroupChain, Required: true, Purpose: "Old token proxy: decimals, admin role, lock upgrade, and sweep target."},
 	{Key: "NEW_TOKEN", Label: "Celo SFLUV proxy", Group: GroupChain, Required: true, Purpose: "New token proxy: decimals, MINTER role, underlying backing, and distribution target."},
+	{Key: "BERA_CHAIN_ID", Label: "Berachain chain id", Group: GroupChain, Default: "80094", Purpose: "Chain id tagging the legacy Berachain rows copied into the Celo Ponder DB during backfill."},
+	{Key: "NEW_CHAIN_ID", Label: "Celo chain id", Group: GroupChain, Default: "42220", Purpose: "Celo chain id the new Ponder instance indexes; used in the generated Celo Ponder config."},
 
 	{Key: "MIGRATION_DB_CONNECTION_STRING", Label: "Postgres connection string", Group: GroupDB, Secret: true, Required: true, Purpose: "Base postgres URL; the app/ponder/bot databases are derived from it via the suffixes."},
 	{Key: "MIGRATION_DB_APP_SUFFIX", Label: "App DB name", Group: GroupDB, Required: true, Default: "migration_app", Purpose: "App database: wallet snapshot and W9 decimal normalization."},
 	{Key: "MIGRATION_DB_PONDER_SUFFIX", Label: "Ponder DB name", Group: GroupDB, Required: true, Default: "migration_ponder", Purpose: "Ponder database: balance normalization, recompute, balance artifacts, and external wipe."},
 	{Key: "MIGRATION_DB_BOT_SUFFIX", Label: "Bot DB name", Group: GroupDB, Required: true, Default: "migration_bot", Purpose: "Bot database: recovery_balances seeding for non-migrated holders."},
+	{Key: "MIGRATION_DB_CELO_PONDER_SUFFIX", Label: "Celo Ponder DB name", Group: GroupDB, Default: "migration_celo_ponder", Purpose: "Dedicated database the new Celo Ponder instance runs against; the Berachain history is backfilled into it for cross-chain continuity."},
+	{Key: "CELO_PONDER_SCHEMA", Label: "Celo Ponder schema", Group: GroupDB, Default: "public", Purpose: "Schema the Celo Ponder instance writes its tables to in the Celo Ponder database."},
 
 	{Key: "CONTRACT_DEPLOYER_PRIVATE_KEY", Label: "Contract deployer key", Group: GroupKeys, Secret: true, Required: true, Purpose: "Holds DEFAULT_ADMIN_ROLE on the old token; performs the Berachain lock upgrade (and sweep)."},
 	{Key: "WALLET_DEPLOYER_PRIVATE_KEY", Label: "Wallet deployer key", Group: GroupKeys, Secret: true, Required: true, Purpose: "Deploys Celo smart wallets via the account factory; needs CELO gas."},
 	{Key: "DISTRIBUTOR_PRIVATE_KEY", Label: "Distributor key", Group: GroupKeys, Secret: true, Required: true, Purpose: "Holds MINTER_ROLE and backing USDC; distributes Celo balances; needs CELO gas."},
+	{Key: "CELO_ADMIN_PRIVATE_KEY", Label: "Celo token admin key", Group: GroupKeys, Secret: true, Purpose: "Celo SFLUV admin (DEFAULT_ADMIN, or MINTER_ADMIN+REDEEMER_ADMIN). Used to replicate Berachain MINTER/REDEEMER role holders onto Celo; needs CELO gas."},
+	{Key: "REDEEMER_PRIVATE_KEY", Label: "Redeemer key (wrap check)", Group: GroupKeys, Secret: true, Purpose: "Optional REDEEMER on Celo SFLUV used to unwrap during the wrap/unwrap check. If unset, the distributor must also hold REDEEMER_ROLE."},
 
 	{Key: "ACCOUNT_FACTORY_ADDRESS", Label: "Account factory", Group: GroupParams, Required: true, Default: "0x7cC54D54bBFc65d1f0af7ACee5e4042654AF8185", Purpose: "CW account factory used to derive/deploy smart wallets on Celo (must match Berachain)."},
 	{Key: "MIGRATION_EXTRA_FUNDED_ADDRESSES", Label: "Extra funded addresses", Group: GroupParams, Required: true, Purpose: "Comma-separated service accounts (e.g. faucet) funded on Celo alongside wallets-table addresses; 'none' to fund only wallets."},
 	{Key: "MIGRATION_DECIMAL_SCALE", Label: "Decimal scale (old→new)", Group: GroupParams, Required: true, Default: "1000000000000", Purpose: "10^(old decimals − new decimals); divides legacy 18-decimal values to 6-decimal units. Verified against on-chain decimals in preflight."},
 	{Key: "SMART_WALLET_BATCH_SIZE", Label: "Smart wallet batch size", Group: GroupParams, Required: true, Default: "50", Purpose: "Number of smart wallets deployed per forge batch transaction."},
+	{Key: "WRAP_CHECK_AMOUNT", Label: "Wrap/unwrap check amount", Group: GroupParams, Default: "1", Purpose: "Backing base units wrapped then unwrapped by the backing-recovery check before distribution."},
 	{Key: "TREASURY", Label: "Sweep treasury", Group: GroupParams, Purpose: "Destination safe for the deferred Berachain backing sweep (point of no return)."},
 
 	{Key: "CONTRACTS_DIR", Label: "Contracts repo path", Group: GroupRuntime, Required: true, Default: "../../repos/contracts", Purpose: "Path to the forge contracts repo holding the migration scripts."},
 	{Key: "MIGRATION_ARTIFACT_ROOT", Label: "Artifact directory", Group: GroupRuntime, Required: true, Default: "./migration-artifacts", Purpose: "Where snapshots, balance artifacts, backups, and the result JSON are written."},
 	{Key: "MIGRATION_BROADCAST", Label: "Broadcast transactions", Group: GroupRuntime, Required: true, Default: "true", Purpose: "true runs forge with --broadcast and applies DB mutations; false is a dry run (read-only)."},
+	{Key: "MIGRATION_FORGE_CUPS", Label: "Forge RPC rate limit (CUPS)", Group: GroupRuntime, Purpose: "Optional cap on forge's RPC requests/sec (--compute-units-per-second) for rate-limited providers. Batches always run with --slow (one confirmed tx at a time). Empty uses foundry's default (330)."},
 }
 
 func fieldByKey(key string) (Field, bool) {
@@ -69,9 +77,12 @@ func fieldByKey(key string) (Field, bool) {
 	return Field{}, false
 }
 
-// Store is the thread-safe in-memory configuration.
+// Store is the thread-safe in-memory configuration. env holds the values loaded
+// from the environment (the authoritative base); values holds runtime overrides
+// set via the API. Overrides win over env, which wins over the registry default.
 type Store struct {
 	mu     sync.RWMutex
+	env    map[string]string
 	values map[string]string
 }
 
@@ -84,28 +95,60 @@ type FieldView struct {
 	Required bool   `json:"required"`
 	Purpose  string `json:"purpose"`
 	IsSet    bool   `json:"is_set"`
-	Value    string `json:"value"` // empty for secrets; actual value otherwise
+	Value    string `json:"value"`    // actual value; redacted for secrets
+	Redacted bool   `json:"redacted"` // true when Value is a masked secret
 }
 
-// New loads the registry's keys from the environment (and defaults).
+// redactSecret masks a secret for display: for URLs it keeps everything but the
+// password; otherwise it shows the first/last few characters. Lets the operator
+// verify which value is set without exposing it.
+func redactSecret(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	if u, err := url.Parse(v); err == nil && u.Scheme != "" && u.Host != "" {
+		if u.User != nil {
+			if _, hasPw := u.User.Password(); hasPw {
+				// Use a letters-only sentinel so url.String() does not percent-encode
+				// the mask, then swap it for the display mask.
+				const sentinel = "REDACTEDPASSWORD"
+				u.User = url.UserPassword(u.User.Username(), sentinel)
+				return strings.ReplaceAll(u.String(), sentinel, "••••")
+			}
+		}
+		return u.String()
+	}
+	if len(v) > 12 {
+		return v[:6] + "…" + v[len(v)-4:]
+	}
+	return "••••"
+}
+
+// New loads the registry's keys from the environment (kept as the base) and
+// starts with no runtime overrides.
 func New() *Store {
-	s := &Store{values: map[string]string{}}
+	s := &Store{env: map[string]string{}, values: map[string]string{}}
 	for _, f := range Fields {
 		if v := strings.TrimSpace(os.Getenv(f.Key)); v != "" {
-			s.values[f.Key] = v
+			s.env[f.Key] = v
 		}
 	}
 	return s
 }
 
-// Get returns the effective value for a key: an explicit value if set, else the
-// registry default.
+// Get returns the effective value: a runtime override if set, else the
+// environment value, else the registry default.
 func (s *Store) Get(key string) string {
 	s.mu.RLock()
 	v, ok := s.values[key]
+	e := s.env[key]
 	s.mu.RUnlock()
 	if ok && strings.TrimSpace(v) != "" {
 		return strings.TrimSpace(v)
+	}
+	if strings.TrimSpace(e) != "" {
+		return strings.TrimSpace(e)
 	}
 	if f, found := fieldByKey(key); found {
 		return f.Default
@@ -138,7 +181,10 @@ func (s *Store) Views() []FieldView {
 			Key: f.Key, Label: f.Label, Group: f.Group, Secret: f.Secret,
 			Required: f.Required, Purpose: f.Purpose, IsSet: effective != "",
 		}
-		if !f.Secret {
+		if f.Secret {
+			view.Value = redactSecret(effective)
+			view.Redacted = effective != ""
+		} else {
 			view.Value = effective
 		}
 		out = append(out, view)
@@ -162,9 +208,24 @@ func (s *Store) ViewsForKeys(keys []string) []FieldView {
 	return out
 }
 
+// NonSecretOverrides returns the explicitly-set (overridden) values for
+// non-secret fields. Used to persist run state by id; secrets are deliberately
+// excluded so private keys and the DB connection string never touch disk.
+func (s *Store) NonSecretOverrides() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := map[string]string{}
+	for k, v := range s.values {
+		if f, ok := fieldByKey(k); ok && !f.Secret {
+			out[k] = v
+		}
+	}
+	return out
+}
+
 // MissingRequired returns the keys of required fields that have no value.
 func (s *Store) MissingRequired() []string {
-	var missing []string
+	missing := []string{}
 	for _, f := range Fields {
 		if f.Required && s.Get(f.Key) == "" {
 			missing = append(missing, f.Key)
@@ -210,4 +271,27 @@ func (s *Store) PonderDBURL() (string, error) {
 
 func (s *Store) BotDBURL() (string, error) {
 	return s.dbURL(s.Get("MIGRATION_DB_BOT_SUFFIX"))
+}
+
+func (s *Store) CeloPonderDBURL() (string, error) {
+	return s.dbURL(s.Get("MIGRATION_DB_CELO_PONDER_SUFFIX"))
+}
+
+// CeloPonderDBURLRedacted returns the Celo Ponder DB URL with the password
+// masked, safe to display in the UI (e.g. the backfill step warning).
+func (s *Store) CeloPonderDBURLRedacted() (string, error) {
+	raw, err := s.CeloPonderDBURL()
+	if err != nil {
+		return "", err
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	if u.User != nil {
+		if _, hasPw := u.User.Password(); hasPw {
+			u.User = url.UserPassword(u.User.Username(), "****")
+		}
+	}
+	return u.String(), nil
 }

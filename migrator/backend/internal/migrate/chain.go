@@ -60,13 +60,20 @@ func privateKeyAddress(ctx context.Context, key string) (string, error) {
 	return firstToken(out), nil
 }
 
-// forgeArgs assembles a forge-script invocation. broadcast appends --broadcast.
-func forgeArgs(scriptRef, rpc, privateKey string, broadcast bool, sigAndArgs ...string) []string {
+// forgeArgs assembles a forge-script invocation. When broadcasting it adds
+// --slow so each transaction is sent only after the previous one is confirmed
+// (single-tx batches), which paces submissions and never bursts a rate-limited
+// RPC with a whole batch at once. cups, when set, caps the provider request rate
+// via --compute-units-per-second.
+func forgeArgs(scriptRef, rpc, privateKey string, broadcast bool, cups string, sigAndArgs ...string) []string {
 	args := []string{"script", scriptRef}
 	args = append(args, sigAndArgs...)
 	args = append(args, "--rpc-url", rpc, "--private-key", privateKey)
 	if broadcast {
-		args = append(args, "--broadcast")
+		args = append(args, "--broadcast", "--slow")
+	}
+	if c := strings.TrimSpace(cups); c != "" {
+		args = append(args, "--compute-units-per-second", c)
 	}
 	return args
 }

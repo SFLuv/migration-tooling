@@ -31,6 +31,14 @@ func (s *Session) botPool(ctx context.Context) (*pgxpool.Pool, error) {
 	return s.pool(ctx, url)
 }
 
+func (s *Session) celoPonderPool(ctx context.Context) (*pgxpool.Pool, error) {
+	url, err := s.cfg.CeloPonderDBURL()
+	if err != nil {
+		return nil, err
+	}
+	return s.pool(ctx, url)
+}
+
 // pingDB verifies connectivity to a derived database.
 func pingDB(ctx context.Context, p *pgxpool.Pool) error {
 	var one int
