@@ -1,9 +1,13 @@
 # SFLuv Migrator
 
 A frontend + backend web app that runs the Berachain → Celo migration as a
-guided, manually-stepped process. It mirrors `run-migration.sh`: every phase of
-the script is a backend route and a stepper step, gated so a step can only run
-after the previous one succeeds.
+guided, manually-stepped process. **This is the tool we run for the live
+migration** — it supersedes the standalone `run-migration.sh` /
+`backfill-bera-history.sh` scripts, which remain in the tree as a CLI reference
+but have diverged (they still normalize the legacy Ponder in place and wipe
+external rows; the migrator does neither — see "Relationship to the old scripts"
+below). Every migration phase is a backend route and a stepper step, gated so a
+step can only run after the previous one succeeds.
 
 The migrator is **stateful in memory** — loaded config (incl. private keys) and
 per-step status/logs/live-data live in the backend process only. Postgres is
@@ -26,8 +30,8 @@ migrator/
 ## Steps (in order)
 
 1. **Configuration** — load every setting from the environment, show it (secrets
-   masked, never echoed), and override/fill any value. The migration is blocked
-   until all required settings are present.
+   masked, never echoed), and override/fill any value (including the dry-run
+   toggle). The migration is blocked until all required settings are present.
 2. **Preflight** — read-only: RPC reachability, app/ponder/bot DB connectivity,
    token decimals + `DECIMAL_SCALE`, underlying backing decimals, distributor
    `MINTER_ROLE` + deployer `DEFAULT_ADMIN_ROLE`, **gas balances for all three
@@ -36,25 +40,43 @@ migrator/
 3. **Database backups** — `pg_dump` app + ponder.
 4. **Berachain migration lock** — upgrade old token to `SFLUVBeraWipe`.
 5. **Wallet snapshot** — smart-wallet deploy input + snapshot.
-6. **Normalize app W9 totals** — 18→6 decimals (marker-guarded).
-7. **Normalize Ponder values** — 18→6, recompute `transfer_account` (clamped ≥0),
-   clear reorg logs.
-8. **Balance artifacts & external wipe** — app/external balance artifacts; on a
-   real run, delete non-app `transfer_account` rows (atomic with the wipe marker).
-9. **Seed recovery balances** — populate `recovery_balances` (bot DB) for
-   non-migrated holders.
-10. **Deploy Celo smart wallets** — batched `DeploySmartWalletBatch`.
-11. **Distribute Celo balances** — `DistributeBatch` (`depositFor`).
-12. **Completion** — resolve the completion block and write `migration-result.json`.
-13. **Backfill Celo Ponder history** — copy the normalized Berachain Ponder
-    history into the dedicated Celo Ponder DB (`MIGRATION_DB_CELO_PONDER_SUFFIX`)
-    so it becomes the cross-chain continuity ledger. The step shows a prominent
-    warning to **start the new Celo Ponder instance at the resolved Ponder start
-    block, pointing at that DB, before running it** (Ponder must create its
-    tables first). Idempotent; verifies per-table counts and value totals.
+6. **Normalize app W9 totals** — 18→6 decimals in the app DB (marker-guarded).
+   Skipped on dry run.
+7. **Balance artifacts** — **read-only**: derive the app-wallet distribution and
+   external-holder balance artifacts from the legacy Ponder transfer events,
+   normalizing 18→6 on the fly. The legacy Ponder DB is **never mutated** (no
+   in-place normalization, no external wipe).
+8. **Seed recovery balances** — populate `recovery_balances` (bot DB) for
+   non-migrated (external/Citizen Wallet) holders. Skipped on dry run.
+9. **Deploy Celo smart wallets** — batched `DeploySmartWalletBatch`, with a
+   progress indicator.
+10. **Backing recovery check** — simulate wrapping a tiny amount of backing into
+    Celo SFLUV and immediately unwrapping it, proving the backing can be locked
+    AND recovered before minting anything. **Always a dry-run simulation against
+    a fork of the live chain (never broadcasts)**; aborts the migration if the
+    roundtrip would fail.
+11. **Distribute Celo balances** — batched `DistributeBatch` (`depositFor`), with
+    a progress indicator; idempotent (only the remaining delta per address).
+12. **Replicate MINTER/REDEEMER roles** — scan all Berachain SFLUV holders (plus
+    the funded service accounts), detect who holds `MINTER_ROLE`/`REDEEMER_ROLE`
+    on the old token, and grant the same on Celo SFLUV using
+    `CELO_ADMIN_PRIVATE_KEY`. Detection runs even on a dry run; the grant is
+    skipped on dry run.
+13. **Completion** — resolve the completion block and write `migration-result.json`.
+14. **Backfill Celo Ponder history** — copy the Berachain Ponder history into the
+    dedicated Celo Ponder DB (`MIGRATION_DB_CELO_PONDER_SUFFIX`), normalizing
+    18→6 **during the copy**, so it becomes the cross-chain continuity ledger.
+    The step shows a prominent warning + copyable snippets to **start the new
+    Celo Ponder instance at the resolved Ponder start block, pointing at that DB,
+    before running it** (Ponder must create its tables first); the start snippet
+    also creates the Celo Ponder database if it doesn't exist. `transfer_account`
+    is rebuilt from the app distribution (app + funded only; external holders
+    excluded) and the custom `ponder_hooks` registrations are migrated too.
+    Idempotent; verifies per-table counts and value totals. Skipped on dry run.
 
-`MIGRATION_BROADCAST=false` makes it a dry run: forge runs without `--broadcast`
-and DB-mutating steps are skipped (artifacts/preflight still run).
+The dry-run toggle (config) sets `MIGRATION_BROADCAST=false`: forge runs without
+`--broadcast` and DB-mutating steps are skipped (configuration, preflight,
+artifacts, the backing-recovery simulation, and role detection still run).
 
 Artifacts (and the per-run log `migrator.log`) are written to
 `MIGRATION_ARTIFACT_ROOT/<id>`. The forge steps exchange JSON with the migrator
@@ -67,6 +89,38 @@ Preflight blocks the migration until gas is present for every signer on **both
 chains** and the distributor's Celo backing balance **and** allowance cover the
 full Berachain SFLUV total supply converted to new-token units (the 18→6 decimal
 difference is applied via `MIGRATION_DECIMAL_SCALE`).
+
+### Config keys beyond `run-migration.sh`
+
+In addition to everything `run-migration.sh` reads, the migrator uses:
+
+- `CELO_ADMIN_PRIVATE_KEY` (secret) — Celo SFLUV admin (`DEFAULT_ADMIN`, or
+  `MINTER_ADMIN`+`REDEEMER_ADMIN`); signs the role-replication grants. Needs CELO gas.
+- `REDEEMER_PRIVATE_KEY` (secret, optional) — used as the unwrap signer in the
+  backing-recovery check; defaults to the distributor (which then must hold
+  `REDEEMER_ROLE`).
+- `WRAP_CHECK_AMOUNT` (default `1`) — underlying base units wrapped/unwrapped by
+  the backing-recovery check.
+- `MIGRATION_DB_BOT_SUFFIX` — bot DB (recovery balances).
+- `MIGRATION_DB_CELO_PONDER_SUFFIX` / `CELO_PONDER_SCHEMA` — the dedicated Celo
+  Ponder database and schema the backfill targets.
+
+### Relationship to the old scripts
+
+The migrator is authoritative for the live migration. The shell scripts predate
+the current model and have **diverged**:
+
+- `run-migration.sh` still runs `normalize_ponder` (in-place 18→6 normalization
+  of the legacy Ponder) and `balance_artifacts_external_wipe` (deleting external
+  `transfer_account` rows). The migrator does **neither** — the legacy Ponder is
+  read-only and normalization happens during the backfill copy into the dedicated
+  Celo Ponder DB.
+- The scripts have no backing-recovery check and no MINTER/REDEEMER role
+  replication; the migrator adds both.
+- The scripts split the Ponder history copy into a separate
+  `backfill-bera-history.sh`; in the migrator it's the final **Backfill** step.
+
+Prefer the migrator. Treat the scripts as a lower-level reference only.
 
 ## Running
 
