@@ -72,8 +72,8 @@ func backfillWarning(s *Session) string {
 		target = redacted
 	}
 	return fmt.Sprintf(
-		"START THE NEW CELO PONDER INSTANCE AT BLOCK %s POINTING TO %s (database %q) BEFORE RUNNING THIS STEP",
-		block, target, dbName,
+		"CREATE the database %q if it doesn't exist, then START THE NEW CELO PONDER INSTANCE AT BLOCK %s POINTING TO %s BEFORE RUNNING THIS STEP (the start command below creates the database for you)",
+		dbName, block, target,
 	)
 }
 
@@ -96,6 +96,8 @@ func backfillSnippets(s *Session) []Snippet {
 	newToken := strings.ToLower(strings.TrimSpace(s.cfg.Get("NEW_TOKEN")))
 	rpc := s.cfg.Get("NEW_CHAIN_RPC")
 	dbURL, _ := s.cfg.CeloPonderDBURL()
+	maintURL, _ := s.cfg.MaintenanceDBURL()
+	celoDBName := strings.TrimSpace(s.cfg.Get("MIGRATION_DB_CELO_PONDER_SUFFIX"))
 
 	config := fmt.Sprintf(`import { createConfig } from "ponder";
 import { erc20ABI } from "./abis/erc20ABI";
@@ -120,7 +122,13 @@ export default createConfig({
 });
 `, block, celoChainID, newToken)
 
-	run := fmt.Sprintf(`# Local anvil only: anvil freezes its head between transactions, so the start
+	run := fmt.Sprintf(`# Ponder connects to an existing database (it creates schemas/tables, not
+# databases), so the dedicated Celo Ponder database must exist before boot.
+# Create it if missing (no-op if it already exists):
+psql '%[6]s' -tAc "SELECT 1 FROM pg_database WHERE datname='%[7]s'" | grep -q 1 || \
+  psql '%[6]s' -c 'CREATE DATABASE "%[7]s"'
+
+# Local anvil only: anvil freezes its head between transactions, so the start
 # block may not exist yet, and it would sit inside Ponder's finality window
 # (~30 blocks) causing Ponder to index from before it. Mine 64 empty blocks so
 # the start block exists and is finalized. No-op on a live RPC (anvil_mine 404s).
@@ -132,7 +140,7 @@ DATABASE_SCHEMA='%[2]s' \
 PONDER_RPC_URL_1='%[3]s' \
 CHAIN_ID=%[4]s PONDER_CHAIN_ID=%[4]s \
 PONDER_START_BLOCK=%[5]s \
-pnpm exec ponder start`, dbURL, schema, rpc, celoChainID, block)
+pnpm exec ponder start`, dbURL, schema, rpc, celoChainID, block, maintURL, celoDBName)
 
 	return []Snippet{
 		{Title: "Celo ponder.config.ts — replace repos/app/ponder/ponder.config.ts", Language: "ts", Content: config},

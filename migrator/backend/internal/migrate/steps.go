@@ -69,7 +69,7 @@ func buildSteps() []*Step {
 		{
 			ID:          "wrap-unwrap",
 			Name:        "Backing recovery check",
-			Description: "Before minting all balances, wrap a tiny amount of backing into Celo SFLUV and immediately unwrap it, proving the backing can be locked AND recovered (we never lock up backing we can't get back). Aborts the migration if the roundtrip fails. Runs as a simulation on a dry run.",
+			Description: "Before minting all balances, simulate wrapping a tiny amount of backing into Celo SFLUV and immediately unwrapping it, proving the backing can be locked AND recovered (we never lock up backing we can't get back). Always a dry-run simulation against a fork of the live chain — no live transactions — and aborts the migration if the roundtrip would fail.",
 			ConfigKeys:  []string{"NEW_CHAIN_RPC", "NEW_TOKEN", "DISTRIBUTOR_PRIVATE_KEY", "REDEEMER_PRIVATE_KEY", "WRAP_CHECK_AMOUNT", "NEW_CHAIN_ID", "CONTRACTS_DIR", "MIGRATION_BROADCAST"},
 			Run:         runWrapUnwrapCheck,
 		},

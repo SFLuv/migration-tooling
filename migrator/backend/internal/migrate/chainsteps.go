@@ -350,9 +350,12 @@ func runDistribute(ctx context.Context, s *Session, run *StepRun) error {
 	return nil
 }
 
-// runWrapUnwrapCheck wraps then unwraps a tiny amount of backing on Celo SFLUV
-// to prove the backing is recoverable before minting all balances. Runs as a
-// simulation on a dry run (forge without --broadcast) and aborts on failure.
+// runWrapUnwrapCheck simulates wrapping then unwrapping a tiny amount of backing
+// on Celo SFLUV to prove the backing is recoverable before minting all balances.
+// It is ALWAYS a dry-run simulation (forge without --broadcast) — no live
+// transactions are sent in any mode — and aborts the migration if the roundtrip
+// would fail. The simulation still executes depositFor/withdrawTo against a fork
+// of the live chain, so role/allowance/balance problems are caught.
 func runWrapUnwrapCheck(ctx context.Context, s *Session, run *StepRun) error {
 	cfg := s.cfg
 	distributorAddr, err := privateKeyAddress(ctx, cfg.Get("DISTRIBUTOR_PRIVATE_KEY"))
@@ -370,15 +373,17 @@ func runWrapUnwrapCheck(ctx context.Context, s *Session, run *StepRun) error {
 	if rk := strings.TrimSpace(cfg.Get("REDEEMER_PRIVATE_KEY")); rk != "" {
 		env["WRAP_CHECK_REDEEMER_KEY"] = rk
 	}
+	// Always simulate: pass broadcast=false regardless of MIGRATION_BROADCAST so
+	// the check never sends live transactions.
 	args := forgeArgs("script/WrapUnwrapCheck.s.sol:WrapUnwrapCheck",
-		cfg.Get("NEW_CHAIN_RPC"), cfg.Get("DISTRIBUTOR_PRIVATE_KEY"), cfg.Broadcast(), cfg.Get("MIGRATION_FORGE_CUPS"),
+		cfg.Get("NEW_CHAIN_RPC"), cfg.Get("DISTRIBUTOR_PRIVATE_KEY"), false, cfg.Get("MIGRATION_FORGE_CUPS"),
 		"--sig", "run()")
-	run.log("wrap/unwrap backing-recovery check (broadcast=%v)", cfg.Broadcast())
+	run.log("wrap/unwrap backing-recovery check (dry-run simulation; no live transactions)")
 	if _, err := runForge(ctx, run, cfg.Get("NEW_CHAIN_RPC"), env, s.contractsDir(), args); err != nil {
 		return fmt.Errorf("wrap/unwrap check failed — backing may not be recoverable; aborting before distribution: %w", err)
 	}
 	run.setData("wrap_unwrap_ok", true)
-	run.log("backing is recoverable (wrap/unwrap roundtrip succeeded)")
+	run.log("backing is recoverable (wrap/unwrap roundtrip simulated successfully)")
 	return nil
 }
 

@@ -277,6 +277,14 @@ func (s *Store) CeloPonderDBURL() (string, error) {
 	return s.dbURL(s.Get("MIGRATION_DB_CELO_PONDER_SUFFIX"))
 }
 
+// MaintenanceDBURL returns a connection URL on the same server pointing at the
+// default "postgres" maintenance database, used to CREATE the dedicated Celo
+// Ponder database (Ponder connects to an existing database; it does not create
+// databases itself).
+func (s *Store) MaintenanceDBURL() (string, error) {
+	return s.dbURL("postgres")
+}
+
 // CeloPonderDBURLRedacted returns the Celo Ponder DB URL with the password
 // masked, safe to display in the UI (e.g. the backfill step warning).
 func (s *Store) CeloPonderDBURLRedacted() (string, error) {
