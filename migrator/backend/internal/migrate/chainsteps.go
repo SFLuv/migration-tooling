@@ -59,7 +59,9 @@ func setProgress(run *StepRun, done, total int, label string) {
 	run.setData("progress", map[string]any{"done": done, "total": total, "label": label})
 }
 
-// runBackups dumps the app and Ponder databases before any mutation.
+// runBackups dumps the app and Ponder databases before any mutation, with
+// per-database progress, pg_dump's own per-table --verbose output, and a
+// heartbeat so a long dump is visibly progressing rather than looking hung.
 func runBackups(ctx context.Context, s *Session, run *StepRun) error {
 	dir, err := s.ensureArtifactDir()
 	if err != nil {
@@ -74,20 +76,79 @@ func runBackups(ctx context.Context, s *Session, run *StepRun) error {
 		return err
 	}
 
-	appFile := filepath.Join(dir, "app-db-before.dump")
-	run.log("dumping app database → %s", appFile)
-	if _, err := runner.Run(ctx, run.logger(), "", "pg_dump", "--format=custom", "--no-owner", "--no-acl", appURL, "-f", appFile); err != nil {
-		return fmt.Errorf("app db dump failed: %w", err)
+	dumps := []struct {
+		label, url, file, dataKey string
+	}{
+		{"app", appURL, filepath.Join(dir, "app-db-before.dump"), "app_dump"},
+		{"ponder", ponderURL, filepath.Join(dir, "ponder-db-before.dump"), "ponder_dump"},
 	}
-	run.setData("app_dump", appFile)
-
-	ponderFile := filepath.Join(dir, "ponder-db-before.dump")
-	run.log("dumping ponder database → %s", ponderFile)
-	if _, err := runner.Run(ctx, run.logger(), "", "pg_dump", "--format=custom", "--no-owner", "--no-acl", ponderURL, "-f", ponderFile); err != nil {
-		return fmt.Errorf("ponder db dump failed: %w", err)
+	for i, d := range dumps {
+		if err := dumpDatabase(ctx, run, d.label, i+1, len(dumps), d.url, d.file); err != nil {
+			return fmt.Errorf("%s db dump failed: %w", d.label, err)
+		}
+		run.setData(d.dataKey, d.file)
 	}
-	run.setData("ponder_dump", ponderFile)
 	return nil
+}
+
+// dumpDatabase pg_dumps one database with --verbose (pg_dump streams a line per
+// object to the step log, showing which table is being dumped) and a heartbeat
+// that reports elapsed time and bytes written every few seconds, so a large or
+// slow dump never looks like a hang.
+func dumpDatabase(ctx context.Context, run *StepRun, label string, index, total int, url, file string) error {
+	setProgress(run, index-1, total, fmt.Sprintf("dumping %s database", label))
+	run.log("[%d/%d] dumping %s database → %s", index, total, label, file)
+
+	start := time.Now()
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				run.log("  … still dumping %s database: %s elapsed, %s written",
+					label, time.Since(start).Round(time.Second), humanBytes(fileSize(file)))
+			}
+		}
+	}()
+
+	_, err := runner.Run(ctx, run.logger(), "", "pg_dump", "--format=custom", "--no-owner", "--no-acl", "--verbose", url, "-f", file)
+	close(stop)
+	<-done
+	if err != nil {
+		return err
+	}
+
+	setProgress(run, index, total, fmt.Sprintf("dumped %s database", label))
+	run.log("[%d/%d] %s dump complete: %s in %s", index, total, label, humanBytes(fileSize(file)), time.Since(start).Round(time.Second))
+	return nil
+}
+
+// fileSize returns the file's size in bytes, or 0 if it can't be stat'd yet.
+func fileSize(path string) int64 {
+	if fi, err := os.Stat(path); err == nil {
+		return fi.Size()
+	}
+	return 0
+}
+
+// humanBytes formats a byte count as a human-readable string (e.g. "12.3 MB").
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // runBeraLock upgrades the old token to the write-locking implementation.
